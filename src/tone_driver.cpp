@@ -95,8 +95,9 @@ static void tone_task(void *pvParameters) {
             size_t avail = (streamWriteIdx - streamReadIdx + streamCapacity) % streamCapacity;
             if (avail >= TONE_BUF_SAMPLES) {
                 size_t toRead = TONE_BUF_SAMPLES;
+                float volScale = currentVolume / 21.0f;
                 for (size_t i = 0; i < toRead; i++) {
-                    toneBuf[i] = streamBuf[streamReadIdx];
+                    toneBuf[i] = (int16_t)(streamBuf[streamReadIdx] * volScale);
                     streamReadIdx = (streamReadIdx + 1) % streamCapacity;
                 }
                 size_t bytesWritten = 0;

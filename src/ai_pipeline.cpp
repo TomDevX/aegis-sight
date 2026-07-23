@@ -309,11 +309,10 @@ static void ai_audio_task(void *pvParameters) {
 }
 
 // ============================================================
-// Build JSON request body
+// Build JSON request document (fill a pre-allocated doc)
 // ============================================================
-static String build_request(int16_t *pcm, size_t pcmSamp, const uint8_t *jpeg, size_t jpegLen) {
-    JsonDocument doc;
-
+static void build_request_doc(JsonDocument &doc, int16_t *pcm, size_t pcmSamp,
+                               const uint8_t *jpeg, size_t jpegLen) {
     JsonArray contents = doc["contents"].to<JsonArray>();
     JsonObject content = contents.add<JsonObject>();
     content["role"] = "user";
@@ -353,10 +352,6 @@ static String build_request(int16_t *pcm, size_t pcmSamp, const uint8_t *jpeg, s
 
     JsonArray vals = doc["responseModalities"].to<JsonArray>();
     vals.add("audio");
-
-    String out;
-    serializeJson(doc, out);
-    return out;
 }
 
 // ============================================================
@@ -366,13 +361,23 @@ static void ai_net_task(void *pvParameters) {
     uint8_t *decBuf = (uint8_t *)ps_malloc(64 * 1024);
     if (!decBuf) { vTaskDelete(NULL); return; }
 
+    bool wifiSpawned = false;
+
     while (true) {
+        // --- Proactive Wi‑Fi: connect while user is still recording ---
+        if (pipelineBusy && !dataReady && !wifiSpawned) {
+            wifiSpawned = true;
+            ensure_wifi();
+            continue;
+        }
+        if (!pipelineBusy) wifiSpawned = false;
+
         if (!pipelineBusy || !dataReady) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // --- Wi‑Fi (Multi‑WiFi + WiFiManager fallback) ---
+        // --- Wi‑Fi (already connected by now if proactive succeeded) ---
         if (!ensure_wifi()) {
             Serial.println("[AI_NET] Wi‑Fi unavailable, aborting");
             pipelineBusy = false; dataReady = false; continue;
@@ -380,18 +385,20 @@ static void ai_net_task(void *pvParameters) {
 
         if (!creds_loaded) wifi_creds_refresh();
 
-        // --- Build request body with actual recorded length ---
+        // --- Build JSON doc, stream directly to WiFi client ---
         size_t nSamp = recordPos;
         if (nSamp == 0) {
             Serial.println("[AI_NET] No audio recorded");
             wifi_shutdown(); pipelineBusy = false; dataReady = false; continue;
         }
 
-        String body = build_request(recAudio, nSamp, jpegBuf, jpegSize);
+        JsonDocument doc;
+        build_request_doc(doc, recAudio, nSamp, jpegBuf, jpegSize);
         dataReady = false;
 
-        if (body.length() == 0) {
-            Serial.println("[AI_NET] Empty request body");
+        size_t jsonLen = measureJson(doc);
+        if (jsonLen == 0) {
+            Serial.println("[AI_NET] Empty JSON body");
             wifi_shutdown(); pipelineBusy = false; continue;
         }
 
@@ -407,24 +414,27 @@ static void ai_net_task(void *pvParameters) {
 
         String geminiKey = cached_api_key;
         String path = "/v1beta/" + String(GEMINI_MODEL) + ":streamGenerateContent?alt=sse&key=" + geminiKey;
-        String req = "POST " + path + " HTTP/1.1\r\n"
+
+        // Send headers via String (small), body via serializeJson streaming
+        String hdr = "POST " + path + " HTTP/1.1\r\n"
                      "Host: " + GEMINI_API_HOST + "\r\n"
                      "Content-Type: application/json\r\n"
-                     "Content-Length: " + String(body.length()) + "\r\n"
-                     "Connection: close\r\n\r\n" + body;
+                     "Content-Length: " + String(jsonLen) + "\r\n"
+                     "Connection: close\r\n\r\n";
 
-        Serial.printf("[AI_NET] Sending %d bytes request\n", body.length());
-        client.print(req);
+        Serial.printf("[AI_NET] Sending %zu bytes JSON body\n", jsonLen);
+        client.print(hdr);
+        serializeJson(doc, client);
 
         // Read HTTP header using char buffer (no String allocation)
         bool headerDone = false;
         uint32_t timeout = millis() + 10000;
-        char hdr[256];
+        char respHdr[256];
         while (client.connected() && millis() < timeout) {
-            size_t n = client.readBytesUntil('\n', (uint8_t *)hdr, sizeof(hdr) - 1);
+            size_t n = client.readBytesUntil('\n', (uint8_t *)respHdr, sizeof(respHdr) - 1);
             if (n == 0) continue;
-            hdr[n] = '\0';
-            while (n > 0 && (hdr[n - 1] == '\r' || hdr[n - 1] == ' ')) hdr[--n] = '\0';
+            respHdr[n] = '\0';
+            while (n > 0 && (respHdr[n - 1] == '\r' || respHdr[n - 1] == ' ')) respHdr[--n] = '\0';
             if (n == 0) { headerDone = true; break; }
         }
         if (!headerDone) {
