@@ -1,0 +1,70 @@
+---
+title: Aegis Sight — Dual-Core FreeRTOS System Architecture
+---
+flowchart TB
+    subgraph ESP32-S3["ESP32-S3 (16MB Flash / 8MB OPI PSRAM)"]
+        direction TB
+
+        subgraph Core0["Core 0 — Networking & HTTP"]
+            WIFI["Wi-Fi Multi-Net<br/>(modem-sleep idle,<br/>full power on request)"]
+            HTTP["HTTP Client<br/>(WiFiClientSecure<br/>setInsecure)"]
+            SSE["SSE Stream Parser<br/>(char buffer,<br/>zero String alloc)"]
+            JSON["JSON Builder<br/>(ArduinoJson v7,<br/>stream serializeJson)"]
+            CACHE["Credential Cache<br/>(globals from NVS)"]
+        end
+
+        subgraph Core1["Core 1 — Hardware & Audio"]
+            AI_AUDIO["AI Audio Task (prio 5)<br/>Hold-to-Talk FSM<br/>JPEG capture + Mic record"]
+            FALL["Fall Detection (prio 4)<br/>MPU6050 3-Phase FSM<br/>→ SOS alarm"]
+            TONE["Tone Driver (prio 3)<br/>I2S TX + sine gen<br/>+ AI stream ring buffer"]
+            US["Ultrasonic (prio 2)<br/>HC-SR04 ISR → beep"]
+            AV["Auto Volume (prio 1)<br/>Mic RMS → vol 1-21"]
+        end
+
+        subgraph Peripherals["Peripherals"]
+            CAM["Camera OV2640<br/>(SVGA JPEG)"]
+            MIC["Mic INMP441<br/>(I2S RX, 16kHz)"]
+            SPK["Speaker Seeed Grove<br/>(I2S TX, 16kHz)"]
+            SR04["HC-SR04<br/>(Trig=8, Echo=9)"]
+            MPU["MPU6050<br/>(I2C SDA=47, SCL=48)"]
+            BTN["Button GPIO14<br/>(INPUT_PULLUP)"]
+        end
+
+        subgraph Memory["Memory (PSRAM)"]
+            RECBUF["recAudio[128k samples]<br/>~256KB"]
+            JPGBUF["jpegBuf[64KB]"]
+            DECBUF["decBuf[64KB]"]
+            RINGBUF["streamRingBuf[64KB]"]
+        end
+    end
+
+    subgraph Cloud["Cloud"]
+        GEMINI["Gemini 2.5 Flash<br/>streamGenerateContent<br/>HTTPS POST + SSE"]
+    end
+
+    %% Core 0 connections
+    WIFI <--> HTTP
+    HTTP --> SSE
+    JSON --> HTTP
+    CACHE --> JSON
+    CACHE --> WIFI
+    SSE --> RINGBUF
+
+    %% Core 1 connections
+    AI_AUDIO --> CAM
+    AI_AUDIO --> MIC
+    AI_AUDIO --> BTN
+    AI_AUDIO --> RECBUF
+    AI_AUDIO --> JPGBUF
+    TONE --> SPK
+    TONE --> RINGBUF
+    TONE --> AI_AUDIO
+    FALL --> MPU
+    FALL --> TONE
+    FALL --> BTN
+    FALL -.->|reset when busy| AI_AUDIO
+    US --> SR04
+    US --> TONE
+    AV --> MIC
+    AV --> TONE
+    AV -.->|release I2S when busy| AI_AUDIO

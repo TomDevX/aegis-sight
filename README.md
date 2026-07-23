@@ -164,9 +164,9 @@ Board: `esp32-s3-devkitc-1` (Arduino framework, 16MB Flash QIO, 8MB OPI PSRAM).
 
 ---
 
-## Roadmap
+## Todo
 
-- **Phase 1** ✅ — HW validation tests for each peripheral
-- **Phase 2** ✅ — Core 1 real-time tasks (ultrasonic, fall, auto-volume)
-- **Phase 3** ✅ — HTTP REST + Gemini pipeline (Core 0 HTTPS + Core 1 Hold-to-Talk)
-- **Phase 4** ✅ — Integration & latency tuning (< 1.5s)
+- [x] **Phase 1** — HW validation tests for each peripheral
+- [x] **Phase 2** — Core 1 real-time tasks (ultrasonic, fall, auto-volume)
+- [x] **Phase 3** — HTTP REST + Gemini pipeline (Core 0 HTTPS + Core 1 Hold-to-Talk)
+- [x] **Phase 4** — Integration & latency tuning (< 1.5s)

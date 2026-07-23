@@ -1,0 +1,54 @@
+---
+title: Boot Flow — Factory Reset, Config Portal & Normal Init
+---
+flowchart TD
+    START["Power ON / Reset"] --> PIN_MODE["pinMode(BTN, INPUT_PULLUP)"]
+    PIN_MODE --> CHECK_RESET{"Button held LOW<br/>for 5 seconds?"}
+    CHECK_RESET -->|YES| CLEAR_NVS["secrets_clear()<br/>(factory reset)"]
+    CHECK_RESET -->|NO| HAS_ALL{"secrets_has_all()?<br/>SSID + API Key present?"}
+    CLEAR_NVS --> PORTAL
+
+    HAS_ALL -->|NO| PORTAL
+    HAS_ALL -->|YES| NORMAL
+
+    subgraph PORTAL["Config Portal (setup(), before FreeRTOS)"]
+        AP["Start AP 'AegisSight-Setup'<br/>IP 192.168.4.1"]
+        DNS["DNS catch-all: * → AP IP"]
+        WEB["WebServer port 80<br/>serve HTML form"]
+        SAVE["User submits SSID + Pass + API Key"]
+        SAVENVS["Save to NVS Preferences"]
+        RESTART1["ESP.restart()"]
+
+        AP --> DNS --> WEB
+        WEB --> SAVE
+        SAVE --> SAVENVS
+        SAVENVS --> RESTART1
+    end
+
+    subgraph NORMAL["Normal Init Sequence"]
+        INIT_I2C["Wire.begin(SDA=47, SCL=48)<br/>for MPU6050"]
+        INIT_CAM["esp_camera_init()<br/>SVGA JPEG, PSRAM"]
+        INIT_BTN["pinMode(BTN, INPUT_PULLUP)<br/>Trigger GPIO14"]
+        INIT_TONE["tone_driver_init()<br/>I2S TX, PSRAM buffer"]
+        SPAWN_US["ultrasonic_task_start()<br/>Core 1, prio 2"]
+        SPAWN_FALL["fall_detection_task_start()<br/>Core 1, prio 4"]
+        SPAWN_AV["auto_volume_task_start()<br/>Core 1, prio 1"]
+        SPAWN_AI["ai_pipeline_net_task_start() Core 0<br/>ai_pipeline_audio_task_start() Core 1"]
+        DONE["All tasks running<br/>FreeRTOS scheduler"]
+
+        INIT_I2C --> INIT_CAM
+        INIT_CAM --> INIT_BTN
+        INIT_BTN --> INIT_TONE
+        INIT_TONE --> SPAWN_US
+        SPAWN_US --> SPAWN_FALL
+        SPAWN_FALL --> SPAWN_AV
+        SPAWN_AV --> SPAWN_AI
+        SPAWN_AI --> DONE
+    end
+
+    NOTE0["Portal timeout: 5 min → auto restart"]
+    NOTE1["No delay() in tasks, OK in setup()"]
+    NOTE2["Portal runs before FreeRTOS scheduler starts"]
+    NOTE0 -.-> PORTAL
+    NOTE1 -.-> PORTAL
+    NOTE2 -.-> PORTAL

@@ -1,0 +1,60 @@
+flowchart TD
+    %% 1. KHOI DONG HE THONG
+    Start([1. RESET / POWER ON]) --> InitHW[2. Khởi tạo Phần cứng & PSRAM<br>Cam OV2640, INMP441, MPU6050, HC-SR04, I2S]
+    InitHW --> InitWiFi{3. Thử quét & kết nối<br>WiFi quen thuộc?}
+
+    InitWiFi -- Không thấy WiFi --> ConfigAP[3b. Bật Captive Portal AP<br>Nút AegisSight-Setup chờ nhập Pass]
+    ConfigAP --> SaveNVS[Lưu WiFi mới vào Flash NVS]
+    SaveNVS --> ConnectSTA[Kết nối WiFi thành công]
+    InitWiFi -- Có WiFi --> ConnectSTA
+
+    ConnectSTA --> DisableAP[4. TẮT WebServer/AP<br>Bật WiFi.setSleep WIFI_PS_MIN_MODEM]
+    DisableAP --> LaunchFreeRTOS[5. Kích hoạt FreeRTOS Dual-Core Tasks]
+
+    %% 2. PHA LUONG DUAL-CORE
+    LaunchFreeRTOS --> Core0_Loop
+    LaunchFreeRTOS --> Core1_Loop
+
+    subgraph Core0 ["CORE 0: Networking & AI Pipeline Task"]
+        Core0_Loop[Chờ Signal Event từ Core 1] --> IsTriggered{Có sự kiện<br>Hold-to-Talk?}
+        IsTriggered -- Không --> Core0_Loop
+        IsTriggered -- Có --> BuildPayload[Lấy Ảnh JPEG + Audio PCM từ PSRAM<br>Thêm Header WAV 44-bytes & Mã hóa Base64]
+        BuildPayload --> SendREST[Gửi HTTP POST Request đến Gemini API<br>Model: gemini-2.5-flash]
+        SendREST --> StreamAudioOut[Nhận Audio Chunk Stream<br>Đẩy vào RingBuffer PSRAM]
+        StreamAudioOut --> Core0_Loop
+    end
+
+    subgraph Core1 ["CORE 1: Real-time Sensors & DSP Task"]
+        Core1_Loop[Đọc MPU6050, HC-SR04, Mic INMP441] --> CheckFall{"Phát hiện Té ngã?<br>(rơi tự do + chấn động + bất động"}
+        
+        CheckFall -- Đúng --> TriggerSOS["Bật Còi hú SOS khẩn cấp<br>Phát âm thanh tối đa 100% qua I2S"]
+        CheckFall -- Sai --> CalcDistance[Tính khoảng cách vật cản từ HC-SR04]
+        
+        CalcDistance --> DistanceLogic{khoảng cách vật cản < 1.5m?}
+        DistanceLogic -- Đúng --> BeepTone[Phát tiếng Bíp vật cản<br>khoảng cách vật cản càng gần -> Nhịp Bíp càng nhanh]
+        DistanceLogic -- Sai --> MeasureRMS[Đọc Mic RMS -> Tự động chỉnh Volume]
+        
+        BeepTone --> CheckButton
+        MeasureRMS --> CheckButton{Kiểm tra Nút GPIO 14<br>Bấm giữ Hold-to-Talk?}
+
+        CheckButton -- Đang bấm giữ --> RecAudio[Chụp ngay 1 ảnh JPEG vào PSRAM<br>Ghi âm Mic INMP441 liên tục max 8s]
+        CheckButton -- Thả nút out --> SignalCore0[Chốt file Audio PCM<br>Bắn Signal báo Core 0 xử lý AI]
+        CheckButton -- Không tương tác --> Core1_Loop
+        
+        RecAudio --> CheckButton
+        SignalCore0 --> Core1_Loop
+        TriggerSOS --> Core1_Loop
+    end
+
+    %% Dinh nghia Style & Class RIENG BIET (Tranh loi Parse Error)
+    classDef startFinish fill:#2B2D42,stroke:#1D1E2C,stroke-width:2px,color:#FFF;
+    classDef process fill:#4A90E2,stroke:#2170D0,stroke-width:1.5px,color:#FFF;
+    classDef decision fill:#F5A623,stroke:#D08000,stroke-width:1.5px,color:#FFF;
+    classDef core0 fill:#2ECC71,stroke:#27AE60,stroke-width:1.5px,color:#FFF;
+    classDef core1 fill:#9B59B6,stroke:#8E44AD,stroke-width:1.5px,color:#FFF;
+
+    class Start startFinish;
+    class InitHW,ConfigAP,SaveNVS,ConnectSTA,DisableAP,LaunchFreeRTOS process;
+    class InitWiFi,IsTriggered,CheckFall,DistanceLogic,CheckButton decision;
+    class BuildPayload,SendREST,StreamAudioOut core0;
+    class Core1_Loop,TriggerSOS,CalcDistance,BeepTone,MeasureRMS,RecAudio,SignalCore0 core1;

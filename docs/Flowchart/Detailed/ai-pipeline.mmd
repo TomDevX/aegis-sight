@@ -1,0 +1,28 @@
+---
+title: AI Pipeline — Hold-to-Talk FSM & HTTP REST Flow
+---
+stateDiagram-v2
+
+    [*] --> Idle
+
+    Idle --> Recording : button press (LOW edge)
+    Recording --> Waiting : button release / 8s timeout
+    Waiting --> Idle : button press (cancel)
+    Waiting --> HTTPPhase : dataReady
+    HTTPPhase --> Idle : finish / error
+    HTTPPhase --> Waiting : cancel by button
+
+    note left of Idle
+        Poll button at 10ms
+        No ISR, no explicit debounce
+    end note
+    note right of Recording
+        JPEG captured on button press
+        Mic INMP441: 16kHz, 16bit mono
+        PSRAM buffer, max 8s
+    end note
+    note right of HTTPPhase
+        Proactive WiFi starts during Recording
+        Body: serializeJson(doc, client)
+        SSE: char buffer per line
+    end note

@@ -1,0 +1,40 @@
+---
+title: Fall Detection — 3-Phase State Machine with SOS
+---
+stateDiagram-v2
+
+    [*] --> Idle
+
+    Idle --> Freefall : SV < 0.5g
+    Freefall --> Impact : SV > 2.5g (within 300ms)
+    Freefall --> Idle : timeout (no impact)
+    Impact --> Inactivity : SV ~ 1g
+    Impact --> Idle : another impact
+    Inactivity --> Confirmed : still 1g for 2s
+    Inactivity --> Idle : SV > 2.5g or < 0.5g
+    Confirmed --> CancelWindow : beep 800Hz
+    CancelWindow --> SOSAlarm : 10s timeout
+    CancelWindow --> Idle : button press (cancel)
+    SOSAlarm --> Idle : 3 SOS cycles done
+
+    note left of Idle
+        AI active = reset to Idle
+        (user pressing button = not falling)
+    end note
+    note right of Freefall
+        Phase 1: SV < 0.5g (4.9 m/s^2)
+        Free-fall detected
+    end note
+    note right of Impact
+        Phase 2: SV > 2.5g (24.5 m/s^2)
+        Within 300ms after free-fall
+    end note
+    note right of Inactivity
+        Phase 3: SV ~ 1g (9.8 m/s^2)
+        Sustained for 2000ms
+    end note
+    note right of CancelWindow
+        SOS = 3 short + 3 long + 3 short
+        I2S speaker at max volume
+        10s window to cancel
+    end note
