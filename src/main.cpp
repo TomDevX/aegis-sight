@@ -9,6 +9,8 @@
 #include <Wire.h>
 #endif
 
+#include "tone_driver.h"
+
 // ============================================================
 // GLOBAL STATE
 // ============================================================
@@ -24,6 +26,11 @@ static void checkPSRAM(void);
 #ifdef ENABLE_CAMERA_OV2640
 static bool initCamera(void);
 #endif
+
+// Task start functions (Chặng 2)
+void ultrasonic_task_start(void);
+void fall_detection_task_start(void);
+void auto_volume_task_start(void);
 
 // ============================================================
 // SETUP - Runs once on boot
@@ -54,24 +61,35 @@ void setup() {
     Serial.println("[INIT] Trigger button ready on GPIO " + String(BTN_TRIGGER));
     #endif
 
-    // --- Ultrasonic HC-SR04P ---
-    #ifdef ENABLE_ULTRASONIC_HC_SR04P
-    pinMode(ULTRASONIC_TRIG, OUTPUT);
-    pinMode(ULTRASONIC_ECHO, INPUT);
-    digitalWrite(ULTRASONIC_TRIG, LOW);
-    Serial.println("[INIT] Ultrasonic HC-SR04P ready");
+    // --- I2S Speaker (Tone Driver) - shared by all audio features ---
+    if (tone_driver_init()) {
+        tone_driver_start_task();
+        Serial.println("[INIT] I2S Speaker tone driver ready");
+    } else {
+        Serial.println("[ERROR] Tone driver init failed!");
+    }
+
+    // --- Ultrasonic Proximity Beep (Chặng 2) ---
+    #ifdef ENABLE_ULTRASONIC_HC_SR04
+    ultrasonic_task_start();
+    Serial.println("[INIT] Ultrasonic proximity task spawned");
     #endif
 
-    // --- Buzzer SOS (Còi hú cảnh báo té ngã) ---
-    #ifdef ENABLE_BUZZER_SOS
-    pinMode(BUZZER_SOS_PIN, OUTPUT);
-    digitalWrite(BUZZER_SOS_PIN, LOW);
-    Serial.println("[INIT] Buzzer SOS ready");
+    // --- MPU6050 Fall Detection (Chặng 2) ---
+    #ifdef ENABLE_MPU6050_FALL_DETECTION
+    fall_detection_task_start();
+    Serial.println("[INIT] Fall detection task spawned");
+    #endif
+
+    // --- Auto Volume Adjust (Chặng 2) ---
+    #ifdef ENABLE_AUTO_VOLUME
+    auto_volume_task_start();
+    Serial.println("[INIT] Auto volume task spawned");
     #endif
 
     Serial.println("\n========================================");
-    Serial.println("  AEGIS SIGHT v1.0 - HW Validation OK");
-    Serial.println("  ESP32-S3-N16R8-CAM | OPI PSRAM");
+    Serial.println("  AEGIS SIGHT v1.0 - Chặng 2 Ready");
+    Serial.println("  Core 1: US + Fall + AutoVol + Tone");
     Serial.println("========================================");
 }
 

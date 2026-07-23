@@ -13,13 +13,12 @@
 #define ENABLE_SPEAKER_I2S
 
 // Real-time Safety Features (Core 1 background tasks)
-#define ENABLE_ULTRASONIC_HC_SR04P
+#define ENABLE_ULTRASONIC_HC_SR04
 #define ENABLE_MPU6050_FALL_DETECTION
-#define ENABLE_BUZZER_SOS
 
 // Advanced Features
+#define ENABLE_AUTO_VOLUME
 // #define ENABLE_FACE_RECOGNITION
-// #define ENABLE_AUTO_VOLUME
 
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main.cpp flags to avoid conflict
@@ -32,7 +31,8 @@
 // #define ENABLE_CAMERA
 
 // ============================================================
-// CAMERA OV2640 - DVP Bus (Fixed on FPC connector)
+// CAMERA OV2640 - DVP Bus (Right Module - FPC DVP Bus)
+// Dedicated DVP Pins on ESP32-S3 Cam board
 // ============================================================
 #define CAM_PWDN          -1
 #define CAM_RESET         -1
@@ -52,7 +52,7 @@
 #define CAM_PCLK          13
 
 // ============================================================
-// MICROPHONE INMP441 - I2S RX (Channel 0)
+// MICROPHONE INMP441 - I2S RX (Left Module - Channel 0)
 // L/R pin tied to GND = Left channel
 // ============================================================
 #define MIC_BCLK          41  // SCK
@@ -60,7 +60,7 @@
 #define MIC_DATA_IN        2  // SD
 
 // ============================================================
-// SPEAKER PCM5102A / Grove Speaker - I2S TX (Channel 1)
+// SPEAKER - Seeed Grove I2S / PCM5102A (Right Module - I2S TX Ch 1)
 // ============================================================
 #define SPK_BCLK           1  // BCLK
 #define SPK_LRCK           3  // WS (LRCK)
@@ -68,26 +68,21 @@
 
 // ============================================================
 // TRIGGER BUTTON (Hỏi AI / Hủy SOS) - Hộp Trái
-// Internal Pull-Up, Active LOW
+// Internal Pull-Up (Active LOW)
 // ============================================================
 #define BTN_TRIGGER       14
 
 // ============================================================
-// ULTRASONIC HC-SR04P - Hộp Phải, hướng chính diện
+// ULTRASONIC HC-SR04 - Hộp Phải, hướng chính diện
 // ============================================================
 #define ULTRASONIC_TRIG    8
 #define ULTRASONIC_ECHO    9
 
 // ============================================================
-// MPU6050 - I2C
+// MPU6050 - I2C (Left Module - Wire through Headband)
 // ============================================================
 #define MPU_SDA           47
 #define MPU_SCL           48
-
-// ============================================================
-// BUZZER SOS - Còi hú cảnh báo té ngã (GPIO 46)
-// ============================================================
-#define BUZZER_SOS_PIN     46
 
 // ============================================================
 // SYSTEM CONSTANTS
@@ -102,7 +97,7 @@
 #define I2S_SPK_PORT    I2S_NUM_1
 
 // ============================================================
-// ULTRASONIC HC-SR04P - Beep Thresholds (cm)
+// ULTRASONIC HC-SR04 - Beep Thresholds (cm)
 // Distance > SAFE: silence | WARNING: slow beep | DANGER: fast beep
 // ============================================================
 #define DISTANCE_DANGER    50  // D <= 50cm: beep dồn dập
@@ -122,5 +117,14 @@
 #define FALL_INACTIVITY_MS   2000  // ms of stillness to confirm fall
 #define FALL_CANCEL_WAIT_MS  10000 // ms to wait for user cancel before SOS
 #define FALL_DEBOUNCE_MS     5000  // cooldown after fall alarm (ms)
+
+// ============================================================
+// AUTO-VOLUME RMS THRESHOLDS (16-bit signed PCM)
+// Maps ambient noise RMS -> speaker volume 1-21
+// ============================================================
+#define AV_RMS_QUIET       200    // Quiet room -> volume 5
+#define AV_RMS_MODERATE   2000    // Normal ambient -> volume 10
+#define AV_RMS_LOUD       8000    // Street noise -> volume 16
+#define AV_RMS_MAX       16000    // Very loud -> volume 21 (max)
 
 #endif // CONFIG_H

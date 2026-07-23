@@ -4,7 +4,7 @@
 #include "config.h"
 
 // ============================================================
-// Ultrasonic HC-SR04P Test - Đo khoảng cách liên tục
+// Ultrasonic HC-SR04 Test - Đo khoảng cách liên tục
 // Gửi trigger pulse 10us, đo echo, tính khoảng cách cm
 // Hiển thị khoảng cách + thời gian bay âm qua Serial
 // Kích hoạt: uncomment #define ENABLE_ULTRASONIC_TEST trong config.h
@@ -79,7 +79,7 @@ void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(500);
     Serial.println("\n========================================");
-    Serial.println("  ULTRASONIC TEST - HC-SR04P");
+    Serial.println("  ULTRASONIC TEST - HC-SR04");
     Serial.println("  Trig=GPIO8 | Echo=GPIO9");
     Serial.println("========================================\n");
 
@@ -87,7 +87,7 @@ void setup() {
         Serial.println("[US_TEST] Init failed, halting.");
         return;
     }
-    Serial.println("[US_TEST] HC-SR04P initialized OK\n");
+    Serial.println("[US_TEST] HC-SR04 initialized OK\n");
 }
 
 void loop() {
