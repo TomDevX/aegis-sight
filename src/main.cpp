@@ -10,6 +10,9 @@
 #endif
 
 #include "tone_driver.h"
+#include "ai_pipeline.h"
+#include "secrets.h"
+#include "config_portal.h"
 
 // ============================================================
 // GLOBAL STATE
@@ -27,17 +30,43 @@ static void checkPSRAM(void);
 static bool initCamera(void);
 #endif
 
-// Task start functions (Chặng 2)
 void ultrasonic_task_start(void);
 void fall_detection_task_start(void);
 void auto_volume_task_start(void);
 
 // ============================================================
-// SETUP - Runs once on boot
+// FACTORY RESET: hold button 5s on boot
+// ============================================================
+static void check_factory_reset(void) {
+    pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    uint32_t t = millis();
+    bool held = true;
+    while (millis() - t < 5000) {
+        if (digitalRead(BTN_TRIGGER) != LOW) { held = false; break; }
+        delay(10);
+    }
+    if (held) {
+        Serial.println("[INIT] Factory reset triggered (button held 5s)");
+        secrets_clear();
+        Serial.println("[INIT] Secrets cleared. Starting config portal...");
+        config_portal_start();
+    }
+}
+
+// ============================================================
+// SETUP
 // ============================================================
 void setup() {
     initSerial();
     checkPSRAM();
+
+    // --- Secrets + config portal ---
+    secrets_begin();
+    check_factory_reset();
+    if (!secrets_has_all()) {
+        Serial.println("[INIT] No saved config — starting setup portal");
+        config_portal_start();
+    }
 
     // --- I2C bus for MPU6050 ---
     #ifdef ENABLE_MPU6050_FALL_DETECTION
@@ -87,17 +116,24 @@ void setup() {
     Serial.println("[INIT] Auto volume task spawned");
     #endif
 
+    // --- AI Pipeline (Chặng 3) ---
+    #ifdef ENABLE_AI_PIPELINE
+    ai_pipeline_net_task_start();
+    ai_pipeline_audio_task_start();
+    Serial.println("[INIT] AI pipeline tasks spawned (Core 0 HTTP + Core 1 Capture)");
+    #endif
+
     Serial.println("\n========================================");
-    Serial.println("  AEGIS SIGHT v1.0 - Chặng 2 Ready");
-    Serial.println("  Core 1: US + Fall + AutoVol + Tone");
+    Serial.println("  AEGIS SIGHT v2.0 - Chặng 3 Ready");
+    Serial.println("  Core 0: Wi-Fi + HTTP REST + Gemini");
+    Serial.println("  Core 1: US + Fall + AutoVol + AI Rec + Speaker");
     Serial.println("========================================");
 }
 
 // ============================================================
-// LOOP - Runs repeatedly
+// LOOP
 // ============================================================
 void loop() {
-    // Chnage 1: placeholder loop, expanded in later stages
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
@@ -118,7 +154,6 @@ static void checkPSRAM(void) {
         }
         psramAvailable = true;
 
-        // Test allocation via ps_malloc
         void* testBuf = ps_malloc(4096);
         if (testBuf != NULL) {
             Serial.println("[OK] ps_malloc(4096) test passed");
@@ -144,8 +179,9 @@ static void initSerial(void) {
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println("\n\n========================================");
-    Serial.println("  AEGIS SIGHT v1.0 - Hardware Validation");
+    Serial.println("  AEGIS SIGHT v2.0 - Chặng 3");
     Serial.println("  ESP32-S3-N16R8-CAM | 8MB OPI PSRAM");
+    Serial.println("  Gemini Live Stream Pipeline");
     Serial.println("========================================\n");
 }
 
@@ -176,15 +212,14 @@ static bool initCamera(void) {
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
 
-    // Allocate frame buffers on PSRAM when available
     if (psramAvailable) {
-        config.frame_size   = FRAMESIZE_SVGA;  // 800x600 for AI pipeline
+        config.frame_size   = FRAMESIZE_SVGA;
         config.jpeg_quality = 10;
         config.fb_count     = 2;
         config.fb_location  = CAMERA_FB_IN_PSRAM;
         config.grab_mode    = CAMERA_GRAB_LATEST;
     } else {
-        config.frame_size   = FRAMESIZE_QVGA; // 320x240 fallback
+        config.frame_size   = FRAMESIZE_QVGA;
         config.jpeg_quality = 15;
         config.fb_count     = 1;
         config.fb_location  = CAMERA_FB_IN_DRAM;
@@ -196,7 +231,6 @@ static bool initCamera(void) {
         return false;
     }
 
-    // Apply camera sensor settings
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
         s->set_brightness(s, 1);

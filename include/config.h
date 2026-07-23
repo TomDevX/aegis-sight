@@ -16,6 +16,9 @@
 #define ENABLE_ULTRASONIC_HC_SR04
 #define ENABLE_MPU6050_FALL_DETECTION
 
+// AI Pipeline (Chặng 3 - HTTP REST + Gemini)
+#define ENABLE_AI_PIPELINE
+
 // Advanced Features
 #define ENABLE_AUTO_VOLUME
 // #define ENABLE_FACE_RECOGNITION
@@ -126,5 +129,34 @@
 #define AV_RMS_MODERATE   2000    // Normal ambient -> volume 10
 #define AV_RMS_LOUD       8000    // Street noise -> volume 16
 #define AV_RMS_MAX       16000    // Very loud -> volume 21 (max)
+
+// ============================================================
+// AI PIPELINE (Chặng 3) - HTTP REST + Gemini
+// ============================================================
+// Multi-Wi-Fi - tự động kết nối vào mạng mạnh nhất trong danh sách
+#define WIFI_SSID               ""
+#define WIFI_PASS               ""
+#define WIFI_SSID2              ""
+#define WIFI_PASS2              ""
+#define WIFI_SSID3              ""
+#define WIFI_PASS3              ""
+#define GEMINI_API_KEY          ""
+#define GEMINI_MODEL            "models/gemini-2.5-flash"
+#define GEMINI_API_HOST         "generativelanguage.googleapis.com"
+#define GEMINI_API_PORT         443
+
+// Hold-to-Talk: bấm giữ để ghi âm, thả để gửi. Tối đa 8 giây.
+#define AI_AUDIO_SAMPLE_RATE    16000
+#define AI_AUDIO_MAX_RECORD_MS  8000
+#define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
+
+// Ring buffer for response audio playback (PSRAM)
+#define AI_PCM_RINGBUF_SIZE     (64 * 1024)
+
+// Task config
+#define AI_NET_TASK_STACK       12288
+#define AI_AUDIO_TASK_STACK     8192
+#define AI_NET_TASK_PRIO        2
+#define AI_AUDIO_TASK_PRIO      5
 
 #endif // CONFIG_H

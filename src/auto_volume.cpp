@@ -2,13 +2,8 @@
 #include "config.h"
 #include "driver/i2s.h"
 #include "tone_driver.h"
+#include "ai_pipeline.h"
 #include <math.h>
-
-// ============================================================
-// Auto-Volume Adjust - Mic INMP441 RMS -> Speaker Volume
-// Reads ambient noise from I2S RX, calculates RMS,
-// maps to volume 1-21 for the I2S speaker output
-// ============================================================
 
 #define AV_SAMPLE_RATE    16000
 #define AV_READ_SAMPLES   1024
@@ -16,47 +11,46 @@
 #define AV_TASK_STACK     3072
 #define AV_TASK_PRIO      1
 
-static i2s_chan_handle_t micRxHandle = NULL;
 static int16_t *micBuf = NULL;
 
 static bool init_mic_i2s(void) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_MIC_PORT, I2S_ROLE_MASTER);
-    chan_cfg.auto_clear = true;
-
-    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &micRxHandle);
-    if (err != ESP_OK) {
-        Serial.printf("[AUTO_VOL] i2s_new_channel failed: 0x%x\n", err);
-        return false;
-    }
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AV_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT,
-                        I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = (gpio_num_t)MIC_BCLK,
-            .ws   = (gpio_num_t)MIC_LRCK,
-            .dout = I2S_GPIO_UNUSED,
-            .din  = (gpio_num_t)MIC_DATA_IN,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
-        }
+    i2s_config_t i2s_cfg = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = AV_SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 512,
+        .use_apll = false,
     };
 
-    err = i2s_channel_init_std_mode(micRxHandle, &std_cfg);
+    i2s_pin_config_t pin_cfg = {
+        .bck_io_num = MIC_BCLK,
+        .ws_io_num = MIC_LRCK,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = MIC_DATA_IN,
+    };
+
+    esp_err_t err = i2s_driver_install(I2S_MIC_PORT, &i2s_cfg, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[AUTO_VOL] i2s_channel_init_std_mode failed: 0x%x\n", err);
+        Serial.printf("[AUTO_VOL] i2s_driver_install failed: 0x%x\n", err);
         return false;
     }
 
-    err = i2s_channel_enable(micRxHandle);
+    err = i2s_set_pin(I2S_MIC_PORT, &pin_cfg);
     if (err != ESP_OK) {
-        Serial.printf("[AUTO_VOL] i2s_channel_enable failed: 0x%x\n", err);
+        Serial.printf("[AUTO_VOL] i2s_set_pin failed: 0x%x\n", err);
+        i2s_driver_uninstall(I2S_MIC_PORT);
         return false;
     }
 
     return true;
+}
+
+static void deinit_mic_i2s(void) {
+    i2s_driver_uninstall(I2S_MIC_PORT);
 }
 
 static uint8_t rms_to_volume(float rms) {
@@ -67,12 +61,6 @@ static uint8_t rms_to_volume(float rms) {
 }
 
 static void auto_volume_task(void *pvParameters) {
-    if (!init_mic_i2s()) {
-        Serial.println("[AUTO_VOL] Mic I2S init failed, task halting");
-        vTaskDelete(NULL);
-        return;
-    }
-
     micBuf = (int16_t *)ps_malloc(AV_READ_SAMPLES * sizeof(int16_t));
     if (!micBuf) {
         Serial.println("[AUTO_VOL] ps_malloc failed, task halting");
@@ -80,11 +68,30 @@ static void auto_volume_task(void *pvParameters) {
         return;
     }
 
-    Serial.println("[AUTO_VOL] Task started - ambient noise -> volume mapping");
+    bool micOwned = false;
 
     while (true) {
+        if (ai_pipeline_is_busy()) {
+            if (micOwned) {
+                deinit_mic_i2s();
+                micOwned = false;
+                Serial.println("[AUTO_VOL] Released mic to AI pipeline");
+            }
+            vTaskDelay(pdMS_TO_TICKS(AV_READ_MS));
+            continue;
+        }
+
+        if (!micOwned) {
+            if (!init_mic_i2s()) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            micOwned = true;
+            Serial.println("[AUTO_VOL] Mic I2S re-acquired");
+        }
+
         size_t bytesRead = 0;
-        esp_err_t err = i2s_read(micRxHandle, micBuf,
+        esp_err_t err = i2s_read(I2S_MIC_PORT, micBuf,
                                  AV_READ_SAMPLES * sizeof(int16_t),
                                  &bytesRead, pdMS_TO_TICKS(100));
         if (err != ESP_OK || bytesRead == 0) {
@@ -101,8 +108,6 @@ static void auto_volume_task(void *pvParameters) {
 
         uint8_t vol = rms_to_volume(rms);
         tone_driver_set_volume(vol);
-
-        Serial.printf("[AUTO_VOL] RMS: %.0f -> Volume: %d/21\n", rms, vol);
 
         vTaskDelay(pdMS_TO_TICKS(AV_READ_MS));
     }

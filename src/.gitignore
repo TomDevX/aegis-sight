@@ -1,3 +1,2 @@
 .vscode/*
-CONTEXT.md
-AGENTS.md
+**/secrets.h
