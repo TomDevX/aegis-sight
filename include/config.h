@@ -21,6 +21,13 @@
 // #define ENABLE_FACE_RECOGNITION
 // #define ENABLE_AUTO_VOLUME
 
+// Standalone HW Test Modules (Chặng 1)
+// Uncomment 1 module at a time, comment ALL main.cpp flags to avoid conflict
+// #define ENABLE_MIC_TEST
+// #define ENABLE_SPEAKER_TEST
+// #define ENABLE_ULTRASONIC_TEST
+// #define ENABLE_MPU6050_TEST
+
 // Camera Test Standalone (comment ENABLE_CAMERA_OV2640 để tránh conflict)
 // #define ENABLE_CAMERA
 
