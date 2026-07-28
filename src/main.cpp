@@ -10,6 +10,7 @@
 #endif
 
 #include "tone_driver.h"
+#include "tts_driver.h"
 #include "ai_pipeline.h"
 #include "secrets.h"
 #include "config_portal.h"
@@ -54,8 +55,9 @@ static void check_factory_reset(void) {
 }
 
 // ============================================================
-// SETUP
+// SETUP — excluded when standalone test flag is active
 // ============================================================
+#if !defined(ENABLE_API_TEST) && !defined(ENABLE_MIC_TEST) && !defined(ENABLE_SPEAKER_TEST) && !defined(ENABLE_ULTRASONIC_TEST) && !defined(ENABLE_MPU6050_TEST) && !defined(ENABLE_CAMERA)
 void setup() {
     initSerial();
     checkPSRAM();
@@ -93,10 +95,17 @@ void setup() {
     // --- I2S Speaker (Tone Driver) - shared by all audio features ---
     if (tone_driver_init()) {
         tone_driver_start_task();
+        tone_driver_stream_init();
         Serial.println("[INIT] I2S Speaker tone driver ready");
     } else {
         Serial.println("[ERROR] Tone driver init failed!");
     }
+
+    // --- Cloud Text-to-Speech (Google TTS) ---
+    #ifdef ENABLE_TTS_CLOUD
+    tts_driver_init();
+    Serial.println("[INIT] Cloud TTS (Google Translate) ready");
+    #endif
 
     // --- Ultrasonic Proximity Beep (Chặng 2) ---
     #ifdef ENABLE_ULTRASONIC_HC_SR04
@@ -136,6 +145,7 @@ void setup() {
 void loop() {
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
+#endif
 
 // ============================================================
 // PSRAM CHECK

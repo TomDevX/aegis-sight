@@ -100,7 +100,7 @@
 ## 5. SYSTEM AGENT RULES (MANDATORY FOR OPENCODE)
 
 1. **FreeRTOS Dual-Core Architecture:**
-   - **Core 0:** Quản lý Wi-Fi (Multi-WiFi / WiFiManager AP), gửi HTTP REST Request tới Gemini REST API (`models/gemini-2.5-flash`) và xử lý RingBuffer trên PSRAM.
+   - **Core 0:** Quản lý Wi-Fi (Multi-WiFi / WiFiManager AP), gửi HTTP REST Request tới Gemini REST API (`models//gemini-3.5-flash-lite`) và xử lý RingBuffer trên PSRAM.
    - **Core 1:** Quản lý nút bấm Hold-to-Talk (GPIO 14), đọc Siêu âm (Tính khoảng cách bíp bíp), MPU6050 (Té ngã), Mic INMP441 (Ghi âm động & RMS Auto Volume), phát âm thanh I2S ra Loa Seeed Grove I2S Speaker.
 
 2. **Zero-Delay & Non-blocking Code:**

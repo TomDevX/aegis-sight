@@ -7,31 +7,26 @@
 // Disabled code is completely excluded from build.
 // ============================================================
 
-// Core AI Pipeline (Button -> Camera + Mic -> Cloud AI -> Speaker)
+// Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
 #define ENABLE_CAMERA_OV2640
-#define ENABLE_MICROPHONE_INMP441
 #define ENABLE_SPEAKER_I2S
 
-// Real-time Safety Features (Core 1 background tasks)
-#define ENABLE_ULTRASONIC_HC_SR04
-#define ENABLE_MPU6050_FALL_DETECTION
-
-// AI Pipeline (Chặng 3 - HTTP REST + Gemini)
+// AI Pipeline (Chặng 3 - HTTP REST + Gemini → text → Google TTS)
 #define ENABLE_AI_PIPELINE
 
-// Advanced Features
-#define ENABLE_AUTO_VOLUME
-// #define ENABLE_FACE_RECOGNITION
+// Cloud Text-to-Speech (Google Translate TTS) — HTTP MP3 → decode → play
+#define ENABLE_TTS_CLOUD
 
 // Standalone HW Test Modules (Chặng 1)
-// Uncomment 1 module at a time, comment ALL main.cpp flags to avoid conflict
+// Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
 // #define ENABLE_MIC_TEST
 // #define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
 // #define ENABLE_MPU6050_TEST
 
-// Camera Test Standalone (comment ENABLE_CAMERA_OV2640 để tránh conflict)
-// #define ENABLE_CAMERA
+// Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
+// Comment ALL pipeline flags, uncomment this 1 flag
+// #define ENABLE_API_TEST
 
 // ============================================================
 // CAMERA OV2640 - DVP Bus (Right Module - FPC DVP Bus)
@@ -141,7 +136,7 @@
 #define WIFI_SSID3              ""
 #define WIFI_PASS3              ""
 #define GEMINI_API_KEY          ""
-#define GEMINI_MODEL            "models/gemini-2.5-flash"
+#define GEMINI_MODEL            "models/gemini-3.5-flash-lite"
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
 #define GEMINI_API_PORT         443
 
@@ -150,13 +145,21 @@
 #define AI_AUDIO_MAX_RECORD_MS  8000
 #define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
 
-// Ring buffer for response audio playback (PSRAM)
-#define AI_PCM_RINGBUF_SIZE     (64 * 1024)
+// Ring buffer for TTS/response audio playback (PSRAM)
+// Larger buffer (256KB) to accommodate local TTS PCM generation
+#define AI_PCM_RINGBUF_SIZE     (256 * 1024)
 
 // Task config
 #define AI_NET_TASK_STACK       12288
 #define AI_AUDIO_TASK_STACK     8192
 #define AI_NET_TASK_PRIO        2
 #define AI_AUDIO_TASK_PRIO      5
+
+// ============================================================
+// TEXT-TO-SPEECH — text limits & cloud TTS config
+// ============================================================
+#define TTS_MAX_TEXT_LEN        8192       // Max accumulated text from SSE response
+#define TTS_CLOUD_MAX_CHARS     180        // Google TTS limit (~200 chars per request)
+#define TTS_MP3_BUF_SIZE        (64 * 1024) // PSRAM buffer for downloaded MP3
 
 #endif // CONFIG_H

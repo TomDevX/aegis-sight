@@ -11,7 +11,7 @@ Single environment: `esp32-s3-devkitc-1` (Arduino framework, 16MB Flash QIO, 8MB
 
 ## Architecture
 
-- **FreeRTOS dual-core**: Core 0 = Wi-Fi + HTTP REST (Gemini `generateContent`); Core 1 = all hardware (ultrasonic, MPU6050, mic, speaker, AI audio).
+- **FreeRTOS dual-core**: Core 0 = Wi-Fi + HTTPS (Gemini SSE) → Google TTS (HTTP); Core 1 = button monitor + camera capture.
 - **No `delay()`** — use `vTaskDelay()` or `millis()`-based timers. Exception: `delayMicroseconds(10)` for HC-SR04 trigger pulse, and `delay()` in `setup()` before FreeRTOS starts.
 - **PSRAM mandatory** — all large buffers allocated with `ps_malloc()`. Camera config uses `CAMERA_FB_IN_PSRAM`.
 - **I2S**: Channel 0 (RX, mic), Channel 1 (TX, speaker). Separate I2C bus for MPU6050 (SDA=47, SCL=48).
@@ -28,9 +28,8 @@ Single environment: `esp32-s3-devkitc-1` (Arduino framework, 16MB Flash QIO, 8MB
 Everything is modular via `#define` / `#ifdef`. Comment a flag to exclude that feature at compile time.
 
 ### Main pipeline flags (always on for normal build)
-- `ENABLE_CAMERA_OV2640`, `ENABLE_MICROPHONE_INMP441`, `ENABLE_SPEAKER_I2S`
-- `ENABLE_ULTRASONIC_HC_SR04`, `ENABLE_MPU6050_FALL_DETECTION`
-- `ENABLE_AUTO_VOLUME`, `ENABLE_AI_PIPELINE`
+- `ENABLE_CAMERA_OV2640`, `ENABLE_SPEAKER_I2S`
+- `ENABLE_AI_PIPELINE`, `ENABLE_TTS_CLOUD`
 
 ### Standalone test flags (Chặng 1 — one at a time)
 - `ENABLE_MIC_TEST`, `ENABLE_SPEAKER_TEST`, `ENABLE_ULTRASONIC_TEST`, `ENABLE_MPU6050_TEST`
@@ -52,7 +51,7 @@ Each has its own `setup()`/`loop()` and **will conflict** with `main.cpp`. To ru
 | `src/secrets.cpp` | Preferences (NVS) load/save/clear for credentials |
 | `src/config_portal.cpp` | Captive portal: AP (AegisSight-Setup) + DNS + HTTP form |
 | `src/tone_driver.cpp` | I2S TX init, sine generator, FreeRTOS queue, AI stream ring buffer playback |
-| `src/ai_pipeline.cpp` | Core 0 HTTP task (Wi‑Fi + REST POST + SSE parse) + Core 1 Hold‑to‑Talk mic + JPEG capture |
+| `src/ai_pipeline.cpp` | Core 0 HTTPS (Gemini SSE text) → normalize → Google TTS HTTP; Core 1 button → JPEG capture |
 | `src/ultrasonic_proximity.cpp` | HC-SR04 ISR → distance → `tone_driver_play()` |
 | `src/fall_detection.cpp` | MPU6050 3-phase state machine → SOS via I2S speaker |
 | `src/auto_volume.cpp` | Mic I2S RX RMS → `tone_driver_set_volume()` (releases mic when AI pipeline active) |
@@ -89,18 +88,18 @@ Each has its own `setup()`/`loop()` and **will conflict** with `main.cpp`. To ru
 ## AI Pipeline (Chặng 3 — HTTP REST)
 
 ### Protocol
-- **API**: `POST /v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=API_KEY`
-- **Transport**: HTTPS (`WiFiClientSecure`, `client.setInsecure()`)
-- **Request**: JSON body with `parts` containing base64-encoded JPEG + WAV audio
-- **Response**: SSE stream (`data: {...}`) with `candidates[].content.parts[].inlineData.data` = base64 PCM
+- **API**: `POST /v1beta/models/gemini-3.5-flash-lite:streamGenerateContent?alt=sse&key=API_KEY`
+- **Transport**: HTTPS (`WiFiClientSecure`, `client.setInsecure()`) for Gemini; plain HTTP (`WiFiClient`) for Google TTS
+- **Request**: `systemInstruction` (disable LaTeX/MD) + base64-encoded JPEG image
+- **Response**: SSE stream (`data: {...}`) with `candidates[].content.parts[].text` → accumulate → normalize → split sentences → Google TTS per sentence
 
-### Data flow (Hold‑to‑Talk)
-1. **Press & hold button** → Core 1 captures 1 JPEG frame, starts recording mic INMP441 into PSRAM buffer.
-2. **Release button** / **8s timeout** → Core 1 stops mic, signals `dataReady`.
-3. **Core 0** (net task): if Wi‑Fi was in modem-sleep → instant wake (~10ms); else already connected (proactive Wi‑Fi started during recording) → builds JSON payload (base64 JPEG + WAV) → POST to Gemini → reads SSE stream.
-4. For each SSE `inlineData` chunk: decodes base64 PCM → writes to `tone_driver` stream ring buffer.
+### Data flow (Press‑to‑Ask)
+1. **Press button** → Core 1 captures 1 JPEG frame → signals `dataReady`. **No mic recording** — faster, lower power.
+2. **Core 0** (net task): proactive Wi‑Fi starts as soon as `pipelineBusy` is true (overlaps with JPEG capture) → builds JSON (system instruction + base64 JPEG) → POST to Gemini `streamGenerateContent` → reads SSE text chunks.
+3. After `[DONE]` or `finishReason: "STOP"` → **close SSL** (free TLS RAM) → normalize text (clean LaTeX/MD, Vietnamese pronunciation rules) → split into sentences at `. ? ! \n` (`.` ignored between digits, e.g. `2.147`).
+4. For each sentence: HTTP GET `translate.google.com:80` → download MP3 → decode via Helix MP3 (`libhelix-mp3`) → resample to 16kHz → write to `tone_driver` stream ring buffer → wait for playback complete.
 5. **Core 1** (tone task): reads stream → `i2s_write()` to speaker (with volume scaling).
-6. On `finishReason: "STOP"` or `[DONE]` → cleanup → Wi‑Fi enters modem-sleep (associated, low power). Press button again to cancel playback.
+6. Cleanup → Wi‑Fi enters modem-sleep. Press button during playback to cancel.
 
 ## Secrets & NVS persistence
 
@@ -136,7 +135,7 @@ Credentials only come from NVS (set via portal). No compile-time defaults.
 
 | Area | What | Benefit |
 |---|---|---|
-| **Proactive Wi‑Fi** | `ai_net_task` calls `ensure_wifi()` as soon as `pipelineBusy && !dataReady` (user still recording) | Wi‑Fi connects **during** recording, saving ~500-1500ms per cycle |
+| **Proactive Wi‑Fi** | `ai_net_task` calls `ensure_wifi()` as soon as `pipelineBusy && !dataReady` (during JPEG capture) | Wi‑Fi connects **during** JPEG capture, saving ~500-1500ms per cycle |
 | **Streaming JSON body** | `serializeJson(doc, client)` replaces `serializeJson(doc, String)` — body streams directly to HTTPS | No giant String (~500KB), writes in chunks, reduces CPU + memory latency |
 | **AI stream volume** | Tone task applies `currentVolume` scaling to AI PCM samples | AI voice respects auto-volume adjustment |
 | **Fall detection integration** | Resets to `FALL_IDLE` when `ai_pipeline_is_busy()` | User pressing button = not falling, no false SOS |
@@ -156,7 +155,9 @@ Credentials only come from NVS (set via portal). No compile-time defaults.
 - `links2004/WebSockets` is removed — the pipeline uses `WiFiClientSecure` for HTTPS.
 - `ArduinoJson` v7 is used for building the JSON request and parsing SSE events.
 - Camera uses `FRAMESIZE_SVGA` (800×600, JPEG Q10) for the AI pipeline.
-- Task priorities: AI_audio (5), fall_det (4), tone (3), AI_net (2), ultrasonic (2), auto_vol (1).
+- Task priorities: AI_net (2), AI_audio (4), tone (3). No mic/fall/ultrasonic tasks in simplified mode.
+- Google TTS uses **HTTP** (port 80) with `client=gtx` — no TLS overhead, saves RAM.
+- SSL connection to Gemini is closed **before** TTS starts to free TLS memory (~50KB).
 - I2S uses **legacy API** (`i2s_driver_install`), NOT `i2s_new_channel`.
 - `WiFiClientSecure::setInsecure()` is used for HTTPS (no cert validation).
 - Config portal runs in `setup()` before FreeRTOS tasks; `delay()` is acceptable there.

@@ -102,6 +102,7 @@ static void handle_save(void) {
     server.send(200, "text/html; charset=utf-8", page);
 
     saved = true;
+    secrets_end();
     delay(500);
     ESP.restart();
 }
