@@ -60,8 +60,6 @@ void tts_driver_speak(const char *text, size_t len) {
     ttsBusy = true;
     ttsCancel = false;
 
-    if (len > TTS_CLOUD_MAX_CHARS) len = TTS_CLOUD_MAX_CHARS;
-
     uint8_t *mp3Buf = (uint8_t *)ps_malloc(TTS_MP3_BUF_SIZE);
     if (!mp3Buf) { ttsBusy = false; return; }
 
@@ -103,9 +101,10 @@ void tts_driver_speak(const char *text, size_t len) {
 
     size_t mp3Len = 0;
     while (client.connected() && mp3Len < TTS_MP3_BUF_SIZE) {
-        int c = client.read();
-        if (c == -1) break;
-        mp3Buf[mp3Len++] = (uint8_t)c;
+        int room = TTS_MP3_BUF_SIZE - mp3Len;
+        int got = client.read(mp3Buf + mp3Len, room > 512 ? 512 : room);
+        if (got <= 0) break;
+        mp3Len += got;
     }
     client.stop();
 

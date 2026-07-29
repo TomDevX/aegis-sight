@@ -28,8 +28,8 @@ bool tone_driver_init(void) {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = 512,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
         .use_apll = false,
     };
 
@@ -108,7 +108,7 @@ static void tone_task(void *pvParameters) {
             if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
                 goto play_tone;
             }
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 

@@ -3,7 +3,7 @@ import threading
 import os
 import sys
 
-# Thay 'COM3' bằng cổng COM thực tế của ESP32-S3
+# Thay 'COM8' bằng cổng COM thực tế của ESP32-S3
 COM_PORT = 'COM8' 
 BAUD_RATE = 115200
 OUTPUT_FILE = 'gemini_tts.mp3'
@@ -45,7 +45,7 @@ def read_from_esp32():
                 print(f"[SUCCESS] Đã tạo file: {os.path.abspath(OUTPUT_FILE)}")
                 
                 # Tự động phát file MP3 trên Windows
-                os.system(f'start {OUTPUT_FILE}')
+                # os.system(f'start {OUTPUT_FILE}')
                 receiving = False
                 print("\n> ", end='', flush=True)
                 continue

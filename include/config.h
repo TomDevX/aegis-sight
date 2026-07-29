@@ -8,14 +8,14 @@
 // ============================================================
 
 // Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
-#define ENABLE_CAMERA_OV2640
-#define ENABLE_SPEAKER_I2S
+// #define ENABLE_CAMERA_OV2640
+// #define ENABLE_SPEAKER_I2S
 
 // AI Pipeline (Chặng 3 - HTTP REST + Gemini → text → Google TTS)
-#define ENABLE_AI_PIPELINE
+// #define ENABLE_AI_PIPELINE
 
 // Cloud Text-to-Speech (Google Translate TTS) — HTTP MP3 → decode → play
-#define ENABLE_TTS_CLOUD
+// #define ENABLE_TTS_CLOUD
 
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
@@ -26,7 +26,7 @@
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
-// #define ENABLE_API_TEST
+#define ENABLE_API_TEST
 
 // ============================================================
 // CAMERA OV2640 - DVP Bus (Right Module - FPC DVP Bus)
@@ -85,7 +85,7 @@
 // ============================================================
 // SYSTEM CONSTANTS
 // ============================================================
-#define SERIAL_BAUD     115200
+#define SERIAL_BAUD     2000000
 #define PSRAM_EXPECTED_SIZE (8 * 1024 * 1024)  // 8MB
 
 // ============================================================
@@ -137,8 +137,10 @@
 #define WIFI_PASS3              ""
 #define GEMINI_API_KEY          ""
 #define GEMINI_MODEL            "models/gemini-3.5-flash-lite"
+#define GEMINI_MODEL_SHORT      "gemini-3.5-flash-lite"
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
 #define GEMINI_API_PORT         443
+#define GEMINI_UPLOAD_HOST      "storage.googleapis.com"
 
 // Hold-to-Talk: bấm giữ để ghi âm, thả để gửi. Tối đa 8 giây.
 #define AI_AUDIO_SAMPLE_RATE    16000
@@ -159,7 +161,7 @@
 // TEXT-TO-SPEECH — text limits & cloud TTS config
 // ============================================================
 #define TTS_MAX_TEXT_LEN        8192       // Max accumulated text from SSE response
-#define TTS_CLOUD_MAX_CHARS     180        // Google TTS limit (~200 chars per request)
+#define TTS_CLOUD_MAX_CHARS     200        // Google TTS limit (~200 chars per request)
 #define TTS_MP3_BUF_SIZE        (64 * 1024) // PSRAM buffer for downloaded MP3
 
 #endif // CONFIG_H
