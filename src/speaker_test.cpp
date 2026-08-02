@@ -1,9 +1,10 @@
-#ifdef ENABLE_SPEAKER_TEST
-
 #include <Arduino.h>
 #include "config.h"
 #include "driver/i2s.h"
 #include <math.h>
+
+
+#ifdef ENABLE_SPEAKER_TEST
 
 // ============================================================
 // Speaker PCM5102A Test - I2S TX 16kHz 16-bit

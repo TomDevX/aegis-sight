@@ -1,8 +1,8 @@
-#ifdef ENABLE_MIC_TEST
-
 #include <Arduino.h>
 #include "config.h"
 #include "driver/i2s.h"
+
+#ifdef ENABLE_MIC_TEST
 
 // ============================================================
 // Microphone INMP441 Test - I2S RX 16kHz 16-bit Mono

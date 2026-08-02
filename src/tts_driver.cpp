@@ -9,6 +9,7 @@
 
 static volatile bool ttsBusy = false;
 static volatile bool ttsCancel = false;
+static WiFiClient *activeClient = NULL;
 
 static void url_encode(const char *src, size_t len, char *dst, size_t dstLen) {
     size_t p = 0;
@@ -74,11 +75,12 @@ void tts_driver_speak(const char *text, size_t len) {
     free(urlEnc);
 
     WiFiClient client;
-    client.setTimeout(5000);
+    client.setTimeout(1000);
+    activeClient = &client;
 
     if (!client.connect("translate.google.com", 80)) {
         Serial.println("[TTS] Connection failed");
-        free(mp3Buf); ttsBusy = false; return;
+        activeClient = NULL; free(mp3Buf); ttsBusy = false; return;
     }
 
     String req = "GET " + String(path) + " HTTP/1.1\r\n"
@@ -90,23 +92,30 @@ void tts_driver_speak(const char *text, size_t len) {
     bool headerDone = false;
     uint32_t tmo = millis() + 5000;
     char hdr[256];
-    while (client.connected() && millis() < tmo) {
+    while (client.connected() && millis() < tmo && !ttsCancel) {
         size_t n = client.readBytesUntil('\n', (uint8_t *)hdr, sizeof(hdr) - 1);
         if (n == 0) continue;
         hdr[n] = '\0';
         while (n > 0 && (hdr[n - 1] == '\r' || hdr[n - 1] == ' ')) hdr[--n] = '\0';
         if (n == 0) { headerDone = true; break; }
     }
-    if (!headerDone) { client.stop(); free(mp3Buf); ttsBusy = false; return; }
+    if (!headerDone || ttsCancel) { client.stop(); activeClient = NULL; free(mp3Buf); ttsBusy = false; return; }
 
     size_t mp3Len = 0;
-    while (client.connected() && mp3Len < TTS_MP3_BUF_SIZE) {
-        int room = TTS_MP3_BUF_SIZE - mp3Len;
-        int got = client.read(mp3Buf + mp3Len, room > 512 ? 512 : room);
-        if (got <= 0) break;
-        mp3Len += got;
+    while (mp3Len < TTS_MP3_BUF_SIZE && !ttsCancel) {
+        if (client.available()) {
+            int room = TTS_MP3_BUF_SIZE - mp3Len;
+            int got = client.read(mp3Buf + mp3Len, room > 512 ? 512 : room);
+            if (got <= 0) break;
+            mp3Len += got;
+        } else if (!client.connected()) {
+            break;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
     }
     client.stop();
+    activeClient = NULL;
 
     if (mp3Len == 0) { free(mp3Buf); ttsBusy = false; return; }
     Serial.printf("[TTS] Downloaded %zu bytes MP3\n", mp3Len);
@@ -178,6 +187,10 @@ bool tts_driver_is_busy(void) {
 void tts_driver_stop(void) {
     ttsCancel = true;
     ttsBusy = false;
+    if (activeClient) {
+        activeClient->stop();
+        activeClient = NULL;
+    }
     tone_driver_stream_set_active(false);
 }
 

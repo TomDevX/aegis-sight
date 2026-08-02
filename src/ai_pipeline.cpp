@@ -44,6 +44,7 @@ static bool sse_read_line(WiFiClient &cl, String &out, int tmoMs) {
     out = "";
     unsigned long t0 = millis();
     while (millis() - t0 < (unsigned long)tmoMs) {
+        if (!pipelineBusy) return false;
         if (cl.available()) {
             int c = cl.read();
             if (c < 0) { delay(1); continue; }
@@ -60,6 +61,7 @@ static bool read_sse_event(WiFiClient &cl, String &event, String &data, int tmoM
     event = ""; data = "";
     unsigned long t0 = millis();
     while (millis() - t0 < (unsigned long)tmoMs) {
+        if (!pipelineBusy) return false;
         if (cl.available()) {
             String line;
             if (!sse_read_line(cl, line, tmoMs)) return false;
@@ -412,11 +414,14 @@ static void ai_net_task(void *pv) {
         }
         http_skip_headers(cl, 5000);
 
+        if (!pipelineBusy) { cl.stop(); wifi_sleep(); pipelineBusy = false; dataReady = false; continue; }
+
         // --- Step 5: SSE stream → incremental TTS ---
         ttsSentenceBuf = "";
         bool keepReading = true;
 
         while (cl.connected() && keepReading) {
+            if (!pipelineBusy) { keepReading = false; break; }
             while (cl.available()) {
                 String event, data;
                 if (!read_sse_event(cl, event, data, 10000)) { keepReading = false; break; }
@@ -450,7 +455,8 @@ static void ai_net_task(void *pv) {
                     if (!pipelineBusy) { keepReading = false; break; }
                 }
             }
-            if (cl.available() == 0 && keepReading) delay(5);
+            if (!pipelineBusy) { keepReading = false; break; }
+            if (cl.available() == 0 && keepReading) vTaskDelay(pdMS_TO_TICKS(5));
         }
         cl.stop();
 

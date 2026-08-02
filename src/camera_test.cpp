@@ -1,9 +1,8 @@
-#ifdef ENABLE_CAMERA
-
 #include <Arduino.h>
 #include "config.h"
 #include "esp_camera.h"
 
+#ifdef ENABLE_CAMERA
 // ============================================================
 // Camera Test - Chụp JPEG 1600x1200, lưu PSRAM, in dung lượng
 // Kích hoạt: bỏ comment #define ENABLE_CAMERA trong config.h

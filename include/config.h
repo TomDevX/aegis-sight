@@ -23,10 +23,19 @@
 // #define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
 // #define ENABLE_MPU6050_TEST
+#define ENABLE_MOTION_ULTRA_TEST
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
-#define ENABLE_API_TEST
+// #define ENABLE_API_TEST
+
+// ============================================================
+// MAIN PIPELINE (Chặng 2) - Real-time tasks on Core 1
+// Enable these together for the full main build
+// ============================================================
+// #define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
+// #define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
+// #define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
 
 // ============================================================
 // CAMERA OV2640 - DVP Bus (Right Module - FPC DVP Bus)
@@ -78,9 +87,10 @@
 
 // ============================================================
 // MPU6050 - I2C (Left Module - Wire through Headband)
+// GPIO48 is the onboard LED — moved SCL to a free pin.
 // ============================================================
 #define MPU_SDA           47
-#define MPU_SCL           48
+#define MPU_SCL           39
 
 // ============================================================
 // SYSTEM CONSTANTS
@@ -96,12 +106,22 @@
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Beep Thresholds (cm)
-// Distance > SAFE: silence | WARNING: slow beep | DANGER: fast beep
+// 3 zones: DANGER | WARNING | SAFE (silent)
 // ============================================================
-#define DISTANCE_DANGER    50  // D <= 50cm: beep dồn dập
-#define DISTANCE_WARNING  100  // 50cm < D <= 100cm: beep vừa
-#define DISTANCE_SLOW     150  // 100cm < D <= 150cm: beep chậm
-// D > 150cm: im lặng
+#define DISTANCE_DANGER    35  // D <= 35cm: beep dồn dập
+#define DISTANCE_WARNING   45  // 35cm < D <= 45cm: beep vừa
+// D > 45cm: im lặng
+
+// ============================================================
+// MOTION GATE - MPU6050 accelerometer movement detection
+// Gates ultrasonic beeps: beep ONLY while the user is moving.
+// Detect by stddev of SV over a sliding window (500ms @ 20ms).
+// Hysteresis timers prevent gate flicker.
+// ============================================================
+#define MOTION_WINDOW_SAMPLES  25   // 25 samples x 20ms = 500ms window
+#define MOTION_STDDEV_G       0.08  // stddev(SV) above this = moving
+#define MOTION_ON_MS          400   // sustained movement to enable gate
+#define MOTION_OFF_MS         1200  // sustained stillness to disable gate
 
 // ============================================================
 // FALL DETECTION THRESHOLDS (3-Phase Algorithm)

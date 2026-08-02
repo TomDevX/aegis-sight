@@ -1,10 +1,10 @@
-#ifdef ENABLE_MPU6050_TEST
-
 #include <Arduino.h>
 #include "config.h"
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+
+#ifdef ENABLE_MPU6050_TEST
 
 // ============================================================
 // MPU6050 Test - Đọc accelerometer + gyroscope liên tục
@@ -23,7 +23,7 @@ static bool initMPU6050(void) {
 
     if (!mpu.begin()) {
         Serial.println("[MPU_TEST] MPU6050 not found at I2C address!");
-        Serial.println("[MPU_TEST] Check wiring: SDA=GPIO47 SCL=GPIO48");
+        Serial.println("[MPU_TEST] Check wiring: SDA=GPIO47 SCL=GPIO39");
         return false;
     }
 
@@ -70,7 +70,7 @@ void setup() {
     delay(500);
     Serial.println("\n========================================");
     Serial.println("  MPU6050 TEST - Accelerometer + Gyro");
-    Serial.println("  I2C: SDA=GPIO47 SCL=GPIO48");
+    Serial.println("  I2C: SDA=GPIO47 SCL=GPIO39");
     Serial.println("========================================\n");
 
     if (!initMPU6050()) {

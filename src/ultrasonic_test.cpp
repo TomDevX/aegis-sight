@@ -1,7 +1,9 @@
-#ifdef ENABLE_ULTRASONIC_TEST
-
 #include <Arduino.h>
 #include "config.h"
+
+
+#ifdef ENABLE_ULTRASONIC_TEST
+
 
 // ============================================================
 // Ultrasonic HC-SR04 Test - Đo khoảng cách liên tục
@@ -68,8 +70,6 @@ static void measureDistance(void) {
         Serial.println("[US_TEST] >>> DANGER ZONE");
     } else if (distanceCm <= DISTANCE_WARNING) {
         Serial.println("[US_TEST] >>> WARNING ZONE");
-    } else if (distanceCm <= DISTANCE_SLOW) {
-        Serial.println("[US_TEST] >>> SLOW BEEP ZONE");
     } else {
         Serial.println("[US_TEST] >>> SAFE (silent)");
     }

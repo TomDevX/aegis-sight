@@ -1,14 +1,16 @@
 #include <Arduino.h>
 #include "config.h"
 #include "tone_driver.h"
+#include "motion_gate.h"
 
 // ============================================================
 // Ultrasonic Proximity Beep - HC-SR04 on Core 1
 // Logic: closer object -> faster beep
-//   D > 150cm: silence
-//   100cm < D <= 150cm: slow beep (600ms interval)
-//   50cm < D <= 100cm: medium beep (300ms interval)
-//   D <= 50cm: continuous / rapid beep
+//   D > 45cm: silence
+//   35cm < D <= 45cm: medium beep (300ms interval)
+//   D <= 35cm: continuous / rapid beep
+// Beeps are gated by the motion gate: they only sound while the
+// user is moving (MPU6050 accelerometer motion detection).
 // Beep tone generated via shared I2S Tone Driver
 // ============================================================
 
@@ -63,8 +65,8 @@ static void ultrasonic_task(void *pvParameters) {
     attachInterrupt(digitalPinToInterrupt(ULTRASONIC_ECHO), echo_isr, CHANGE);
 
     Serial.println("[US] Proximity beep task started");
-    Serial.printf("[US] Zones: DANGER<=%dcm | WARNING<=%dcm | SLOW<=%dcm\n",
-                  DISTANCE_DANGER, DISTANCE_WARNING, DISTANCE_SLOW);
+    Serial.printf("[US] Zones: DANGER<=%dcm | WARNING<=%dcm | SAFE\n",
+                  DISTANCE_DANGER, DISTANCE_WARNING);
 
     unsigned long lastMeasure = 0;
     unsigned long lastBeep = 0;
@@ -91,11 +93,10 @@ static void ultrasonic_task(void *pvParameters) {
             beepIntervalMs = 80;
         } else if (lastDistance <= DISTANCE_WARNING) {
             beepIntervalMs = 300;
-        } else if (lastDistance <= DISTANCE_SLOW) {
-            beepIntervalMs = 600;
         }
 
-        if (beepIntervalMs > 0 && (now - lastBeep >= beepIntervalMs)) {
+        if (beepIntervalMs > 0 && motion_gate_enabled() &&
+            (now - lastBeep >= beepIntervalMs)) {
             lastBeep = now;
             tone_driver_play(BEEP_FREQ_HZ, BEEP_DURATION_MS, tone_driver_get_volume());
         }

@@ -5,6 +5,7 @@
 #include <Adafruit_Sensor.h>
 #include "tone_driver.h"
 #include "ai_pipeline.h"
+#include "motion_gate.h"
 
 // ============================================================
 // Fall Detection - MPU6050 3-Phase Algorithm on Core 1
@@ -102,6 +103,7 @@ static void fall_task(void *pvParameters) {
     }
 
     Serial.println("[FALL] 3-phase detection task started");
+    motion_gate_reset();
 
     while (true) {
         // User is pressing button (AI active) — reset fall detection
@@ -116,6 +118,7 @@ static void fall_task(void *pvParameters) {
 
         float sv = read_sv();
         float svG = sv / G_TO_MS2;
+        motion_gate_update(svG);
         unsigned long now = millis();
 
         switch (fallState) {
