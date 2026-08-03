@@ -22,14 +22,14 @@
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
 // #define ENABLE_MIC_TEST
-// #define ENABLE_SPEAKER_TEST
+#define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
 // #define ENABLE_MPU6050_TEST
 // #define ENABLE_MOTION_ULTRA_TEST
 
 // Camera web-stream test (ESP32-S3-CAM, sensor RHYX M21-45/GC2145):
 //   http://<IP> -> captures RGB565 frame, serves as BMP (GC2145 has no JPEG)
-#define ENABLE_CAMERA
+// #define ENABLE_CAMERA
 
 // Mic -> Gemini AI -> Google TTS -> Grove Speaker (full flow test)
 // Bắt buộc kèm #define ENABLE_TTS_CLOUD ở trên

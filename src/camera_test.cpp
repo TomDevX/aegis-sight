@@ -8,8 +8,8 @@
 
 #ifdef ENABLE_CAMERA
 
-const char* ssid = "Umapyoi";
-const char* password = "dokidoki1@";
+const char* ssid = "Homepro";
+const char* password = "Sunny20061@3";
 
 httpd_handle_t stream_httpd = NULL;
 
@@ -26,8 +26,8 @@ static esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
     uint8_t *jpg_buf = NULL;
     size_t jpg_len = 0;
 
-    // 2. Nén JPEG với Quality = 65 (Tối ưu tốc độ, file SVGA nén ra vẫn cực nhẹ)
-    bool converted = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 50, &jpg_buf, &jpg_len);
+    // 2. Nén JPEG với Quality = 20
+    bool converted = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 20, &jpg_buf, &jpg_len);
     esp_camera_fb_return(fb); 
 
     if (!converted) {
@@ -86,7 +86,7 @@ static bool initCamera() {
     config.pin_pwdn     = CAM_PWDN;
     config.pin_reset    = CAM_RESET;
     
-    config.xclk_freq_hz = 15000000;       // Xung nhịp an toàn cho SVGA (16MHz)
+    config.xclk_freq_hz = 15000000;       // Xung nhịp an toàn cho SVGA (15MHz)
     config.pixel_format = PIXFORMAT_RGB565; 
     config.frame_size   = FRAMESIZE_SVGA; // 800x600 mở rộng góc nhìn
     config.fb_count     = 2;
@@ -99,14 +99,25 @@ static bool initCamera() {
         return false;
     }
 
-    // 2. Lấy con trỏ cảm biến SAU KHI đã khởi tạo thành công để cấu hình phơi sáng
     sensor_t *s = esp_camera_sensor_get();
+    // 2. Lấy con trỏ cảm biến SAU KHI đã khởi tạo thành công để cấu hình phơi sáng
+    // mode: stable
     if (s) {
         s->set_exposure_ctrl(s, 0); // Tắt auto exposure
         s->set_aec_value(s, 300);   // Cố định mức phơi sáng
         s->set_gain_ctrl(s, 0);     // Tắt auto gain
         s->set_agc_gain(s, 0);      // Cố định gain thấp
     }
+
+    // mode: environment adaptable. Giờ tôi 
+    // if (s) {
+    //     s->set_exposure_ctrl(s, 1);   // Bật Auto Exposure (AEC)
+    //     s->set_gain_ctrl(s, 1);       // Bật Auto Gain (AGC)
+    //     s->set_whitebal(s, 1);             // Bật Auto White Balance (cân bằng trắng tự động để màu sắc chuẩn xác)
+    //     s->set_aec2(s, 1);            // Bật thuật toán AEC DSP giúp chống lóa sáng mạnh
+    //     s->set_brightness(s, 1);      // Tăng nhẹ độ sáng (tuỳ chọn)
+    //     s->set_contrast(s, 1);        // Tăng nhẹ tương phản để viền chữ nổi bật hơn cho AI
+    // }
 
     return true;
 }

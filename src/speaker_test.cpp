@@ -1,200 +1,205 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include "config.h"
-#include "driver/ledc.h"
-#include "esp_timer.h"
-#include <math.h>
-#include "SPIFFS.h"
-#include "libhelix-mp3/mp3dec.h"
 
 #ifdef ENABLE_SPEAKER_TEST
 
-// ============================================================
-// Speaker Test — phát đoạn gemini_tts.mp3 qua Grove Speaker
-// MP3 nằm trong SPIFFS (flash qua: pio run -t uploadfs)
-// Decode bằng libhelix-mp3 -> PCM 16kHz -> PWM LEDC trên SIG
-// Cùng đường phát giống TTS thật để nghe chất lượng giọng.
-// Kích hoạt: uncomment ENABLE_SPEAKER_TEST trong config.h
-// ============================================================
+#include "AudioFileSourceHTTPStream.h"
+#include "AudioFileSourceBuffer.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutput.h"
 
-#define PWM_CHANNEL       2
-#define PWM_RES_BITS      10
-#define PWM_RES_MAX       ((1 << PWM_RES_BITS) - 1)
-#define PWM_CARRIER_HZ    78125
-#define PWM_DC_MID        (PWM_RES_MAX / 2)
+// -----------------------------------------------------------------------------
+// BỘ XUẤT PWM TỐI ĐA ÂM LƯỢNG (MAX VOLUME) & TRIỆT TIÊU POP NOISE
+// -----------------------------------------------------------------------------
+class SeeedGrovePWMOutput : public AudioOutput {
+private:
+    uint8_t _pin;
+    uint8_t _channel;
+    uint32_t _sample_rate;
+    uint32_t _last_sample_us;
+    uint32_t _sample_interval_us;
+    bool _is_active;
 
-#define SPK_SAMPLE_RATE   16000
-#define MP3_FILENAME      "/gemini_tts.mp3"
-#define MP3_MAX_SIZE      (256 * 1024)
-#define PCM_MAX_SAMPLES   (SPK_SAMPLE_RATE * 10)
-
-static short decodeBuf[1152 * 2];
-static int16_t *g_pcm = NULL;
-static uint32_t g_pcmLen = 0;
-
-static bool spk_set_freq(uint32_t freq_hz) {
-    ledc_timer_config_t t = {};
-    t.speed_mode = LEDC_LOW_SPEED_MODE;
-    t.timer_num = (ledc_timer_t)LEDC_TIMER_1;
-    t.duty_resolution = (ledc_timer_bit_t)PWM_RES_BITS;
-    t.freq_hz = freq_hz;
-    t.clk_cfg = LEDC_USE_APB_CLK;
-    return ledc_timer_config(&t) == ESP_OK;
-}
-
-static size_t resample_linear(const int16_t *in, size_t inLen, int16_t *out,
-                              size_t outCap, uint32_t inRate, uint32_t outRate) {
-    if (inRate == outRate || inLen < 2) {
-        size_t c = (inLen < outCap) ? inLen : outCap;
-        memcpy(out, in, c * sizeof(int16_t));
-        return c;
+public:
+    SeeedGrovePWMOutput(uint8_t pin, uint8_t channel = 2) {
+        _pin = pin;
+        _channel = channel; // Channel 2 tránh đụng Camera (Channel 0)
+        _sample_rate = 24000;
+        _sample_interval_us = 1000000 / _sample_rate;
+        _last_sample_us = 0;
+        _is_active = false;
     }
-    uint32_t step = ((uint32_t)inRate << 16) / outRate;
-    uint32_t pos = 0;
-    size_t o = 0;
-    while (o < outCap) {
-        uint32_t idx = pos >> 16;
-        if (idx + 1 >= inLen) break;
-        uint32_t frac = pos & 0xFFFF;
-        int32_t s = (int32_t)in[idx] + (((int32_t)(in[idx + 1] - in[idx]) * (int32_t)frac) >> 16);
-        out[o++] = (int16_t)s;
-        pos += step;
+
+    virtual bool SetRate(int hz) override {
+        if (hz > 0) {
+            _sample_rate = hz;
+            _sample_interval_us = 1000000 / _sample_rate;
+        }
+        return true;
     }
-    return o;
-}
 
-static uint32_t decode_mp3(const uint8_t *mp3, size_t mp3Len, int16_t *out, size_t outCap) {
-    HMP3Decoder dec = MP3InitDecoder();
-    if (!dec) { Serial.println("[SPK_TEST] MP3InitDecoder failed"); return 0; }
+    virtual bool begin() override {
+        // Tần số PWM 31.25 kHz (8-bit)
+        ledcSetup(_channel, 31250, 8);
+        ledcAttachPin(_pin, _channel);
+        
+        // CHỐNG BỤP/NỔ KHỦNG KHIẾM ĐẦU KHÚC: 
+        // Đưa DC Bias từ 0 -> 128 với bước nhảy cực mịn 1us để màng loa không bị giật
+        for (int b = 0; b <= 128; b++) {
+            ledcWrite(_channel, b);
+            delayMicroseconds(100);
+        }
 
-    unsigned char *inbuf = (unsigned char *)mp3;
-    int bytesLeft = (int)mp3Len;
-    int sampleRate = 24000;
-    size_t total = 0;
+        _last_sample_us = micros();
+        _is_active = true;
+        return true;
+    }
 
-    while (bytesLeft > 0 && total < outCap) {
-        int res = MP3Decode(dec, &inbuf, &bytesLeft, decodeBuf, 0);
-        if (res == ERR_MP3_NONE) {
-            MP3FrameInfo info;
-            MP3GetLastFrameInfo(dec, &info);
-            if (info.nChans > 0 && info.samprate > 0) sampleRate = info.samprate;
-            int samples = info.outputSamps / info.nChans;
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+        if (!_is_active) return true;
 
-            int16_t mono[1152];
-            if (info.nChans == 2) {
-                for (int i = 0; i < samples; i++)
-                    mono[i] = (int16_t)(((int32_t)decodeBuf[i * 2] + (int32_t)decodeBuf[i * 2 + 1]) >> 1);
-            } else {
-                memcpy(mono, decodeBuf, samples * sizeof(int16_t));
-            }
+        // Trộn L/R thành Mono
+        int32_t pcm = ((int32_t)sample[0] + (int32_t)sample[1]) / 2;
+        
+        // --- MAX VOLUME GAIN (x3.5) ---
+        // Đẩy công suất âm thanh lên kịch biên độ 16-bit
+        pcm = (pcm * 7) / 2;
+        if (pcm > 32767)  pcm = 32767;
+        if (pcm < -32768) pcm = -32768;
 
-            size_t playLen;
-            if (sampleRate != SPK_SAMPLE_RATE) {
-                playLen = resample_linear(mono, samples, out + total, outCap - total, sampleRate, SPK_SAMPLE_RATE);
-            } else {
-                size_t c = (samples < outCap - total) ? samples : (outCap - total);
-                memcpy(out + total, mono, c * sizeof(int16_t));
-                playLen = c;
-            }
-            total += playLen;
-        } else if (res == ERR_MP3_INDATA_UNDERFLOW || res == ERR_MP3_MAINDATA_UNDERFLOW) {
-            break;
+        // Chuyển PCM 16-bit signed -> Duty Cycle 8-bit unsigned (0 -> 255)
+        uint8_t duty = (uint8_t)(((pcm + 32768) >> 8) & 0xFF);
+
+        // Đồng bộ thời gian thực 24kHz
+        while ((micros() - _last_sample_us) < _sample_interval_us) {
+            #if defined(ESP32)
+            NOP();
+            #endif
+        }
+        _last_sample_us = micros();
+
+        ledcWrite(_channel, duty);
+        return true;
+    }
+
+    virtual bool stop() override {
+        _is_active = false;
+        
+        // Xả DC Bias từ 128 -> 0 cực mịn chống nổ cuối câu
+        for (int b = 128; b >= 0; b--) {
+            ledcWrite(_channel, b);
+            delayMicroseconds(100);
+        }
+
+        ledcDetachPin(_pin);
+        pinMode(_pin, OUTPUT);
+        digitalWrite(_pin, LOW); // Khóa chân về GND khi rảnh
+        return true;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// KHAI BÁO BIẾN TOÀN CỤC
+// -----------------------------------------------------------------------------
+static AudioGeneratorMP3 *mp3 = NULL;
+static AudioFileSourceHTTPStream *file = NULL;
+static AudioFileSourceBuffer *buff = NULL;
+static SeeedGrovePWMOutput *out = NULL;
+
+static uint32_t lastLoopTime = 0;
+
+static String sampleText = "Xin chào, đây là thử nghiệm phát âm thanh từ Google Translate trên loa Grove";
+
+static String urlEncode(String str) {
+    String encoded = "";
+    char c, code0, code1;
+    for (size_t i = 0; i < str.length(); i++) {
+        c = str.charAt(i);
+        if (isalnum(c)) {
+            encoded += c;
         } else {
-            int sync = MP3FindSyncWord(inbuf, bytesLeft);
-            if (sync >= 0) { inbuf += sync; bytesLeft -= sync; continue; }
-            break;
+            code0 = (c >> 4) & 0xF;
+            code1 = c & 0xF;
+            encoded += '%';
+            encoded += (char)(code0 < 10 ? code0 + '0' : code0 - 10 + 'A');
+            encoded += (char)(code1 < 10 ? code1 + '0' : code1 - 10 + 'A');
         }
     }
-    MP3FreeDecoder(dec);
-    return total;
+    return encoded;
 }
 
-static void pwm_play_pcm(const int16_t *pcm, uint32_t samples) {
-    spk_set_freq(PWM_CARRIER_HZ);
-    int64_t next = esp_timer_get_time();
-    for (uint32_t i = 0; i < samples; i++) {
-        int32_t d = PWM_DC_MID + ((int32_t)pcm[i] >> (16 - PWM_RES_BITS));
-        if (d < 0) d = 0;
-        else if (d > PWM_RES_MAX) d = PWM_RES_MAX;
-        ledcWrite(PWM_CHANNEL, (uint32_t)d);
-        next += 62;   // ~16kHz pacing
-        while (esp_timer_get_time() < next) {}
+static void playGoogleTTS(String text, String lang = "vi") {
+    String url = "http://translate.google.com/translate_tts?ie=UTF-8&q=" 
+               + urlEncode(text) 
+               + "&tl=" + lang 
+               + "&client=tw-ob";
+
+    Serial.printf("\n[TTS] Request URL: %s\n", url.c_str());
+
+    file = new AudioFileSourceHTTPStream(url.c_str());
+    buff = new AudioFileSourceBuffer(file, TTS_MP3_BUF_SIZE);
+    
+    out = new SeeedGrovePWMOutput(SPK_PWM_PIN, 2);
+    out->begin();
+
+    mp3 = new AudioGeneratorMP3();
+    if (mp3->begin(buff, out)) {
+        Serial.println("[TTS] Đang phát tiếng nói qua loa Grove...");
+        lastLoopTime = millis();
+    } else {
+        Serial.println("[TTS] Lỗi khởi tạo MP3!");
     }
-    ledcWrite(PWM_CHANNEL, 0);
 }
 
-// Sóng vuông tần số âm thanh (cách tone_driver làm bíp — đã nghe được)
-static void beep(uint16_t freqHz, uint32_t durationMs) {
-    spk_set_freq(freqHz);
-    ledcWrite(PWM_CHANNEL, 512);
-    vTaskDelay(pdMS_TO_TICKS(durationMs));
-    spk_set_freq(PWM_CARRIER_HZ);
-    ledcWrite(PWM_CHANNEL, 0);
-    vTaskDelay(pdMS_TO_TICKS(100));
-}
-
+// -----------------------------------------------------------------------------
+// SETUP & LOOP
+// -----------------------------------------------------------------------------
 void setup() {
+    // Ép chân loa về LOW ngay giây đầu tiên khi vừa cấp nguồn
+    pinMode(SPK_PWM_PIN, OUTPUT);
+    digitalWrite(SPK_PWM_PIN, LOW);
+
     Serial.begin(SERIAL_BAUD);
     delay(500);
-    Serial.println("\n========================================");
-    Serial.println("  SPEAKER TEST - Play gemini_tts.mp3");
-    Serial.println("  SIG=GPIO40 | libhelix MP3 -> PWM");
-    Serial.println("========================================\n");
 
-    if (!spk_set_freq(PWM_CARRIER_HZ)) {
-        Serial.println("[SPK_TEST] PWM timer config failed");
+    Serial.println("\n=== THỬ NGHIỆM LOA GROVE - GOOGLE TRANSLATE TTS ===");
+
+    WiFi.begin("Homepro", "Sunny20061@3");
+    Serial.print("Đang kết nối WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(200);
+        Serial.print(".");
     }
-    ledcAttachPin(SPK_PWM_PIN, PWM_CHANNEL);
-    ledcWrite(PWM_CHANNEL, 0);
-    Serial.printf("[SPK_TEST] PWM speaker ready (SIG=GPIO%d)\n", SPK_PWM_PIN);
+    Serial.printf("\nWiFi đã kết nối! IP: %s\n", WiFi.localIP().toString().c_str());
 
-    if (!SPIFFS.begin(true)) {
-        Serial.println("[SPK_TEST] SPIFFS mount failed");
-        return;
-    }
-
-    File f = SPIFFS.open(MP3_FILENAME, "r");
-    if (!f) {
-        Serial.printf("[SPK_TEST] Missing %s (run: pio run -t uploadfs)\n", MP3_FILENAME);
-        return;
-    }
-    size_t mp3Len = f.size();
-    if (mp3Len > MP3_MAX_SIZE) mp3Len = MP3_MAX_SIZE;
-    uint8_t *mp3 = (uint8_t *)ps_malloc(mp3Len + 1);
-    if (!mp3) { Serial.println("[SPK_TEST] ps_malloc failed for MP3"); f.close(); return; }
-    f.read(mp3, mp3Len);
-    f.close();
-    Serial.printf("[SPK_TEST] Loaded %s: %u bytes\n", MP3_FILENAME, (unsigned)mp3Len);
-
-    g_pcm = (int16_t *)ps_malloc(PCM_MAX_SAMPLES * sizeof(int16_t));
-    if (!g_pcm) { Serial.println("[SPK_TEST] ps_malloc failed for PCM"); free(mp3); return; }
-    g_pcmLen = decode_mp3(mp3, mp3Len, g_pcm, PCM_MAX_SAMPLES);
-    free(mp3);
-    Serial.printf("[SPK_TEST] Decoded: %u samples (%.1f s @16kHz)\n",
-                  g_pcmLen, (float)g_pcmLen / SPK_SAMPLE_RATE);
-
-    int32_t peak = 0;
-    double sum = 0;
-    for (uint32_t i = 0; i < g_pcmLen; i++) {
-        int32_t a = g_pcm[i] < 0 ? -g_pcm[i] : g_pcm[i];
-        if (a > peak) peak = a;
-        sum += (double)g_pcm[i] * g_pcm[i];
-    }
-    Serial.printf("[SPK_TEST] PCM peak=%d RMS=%.0f\n", peak,
-                  g_pcmLen ? sqrt(sum / g_pcmLen) : 0.0);
-
-    Serial.println("[SPK_TEST] Beep 1kHz 500ms (kiem chung speaker)...");
-    beep(1000, 500);
-    beep(2000, 300);
+    delay(1000); 
+    playGoogleTTS(sampleText, "vi");
 }
 
 void loop() {
-    if (g_pcmLen > 0) {
-        Serial.printf("[SPK_TEST] Playing %u samples...\n", g_pcmLen);
-        pwm_play_pcm(g_pcm, g_pcmLen);
-        Serial.println("[SPK_TEST] Done. Restart to replay.");
-        vTaskDelay(pdMS_TO_TICKS(3000));
+    if (mp3 && mp3->isRunning()) {
+        bool running = mp3->loop();
+        if (running) {
+            lastLoopTime = millis();
+        }
+
+        if (!running || (millis() - lastLoopTime > 1500)) {
+            mp3->stop();
+            Serial.println("[TTS] Đã phát xong!");
+
+            delete mp3;  mp3 = NULL;
+            delete buff; buff = NULL;
+            delete file; file = NULL;
+            delete out;  out = NULL;
+            
+            pinMode(SPK_PWM_PIN, OUTPUT);
+            digitalWrite(SPK_PWM_PIN, LOW);
+        }
     } else {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        Serial.println("[TTS] Tiến hành phát lại...");
+        playGoogleTTS("Thử nghiệm phát lại âm thanh thành công.", "vi");
     }
 }
 
