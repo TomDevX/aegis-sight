@@ -5,7 +5,7 @@
 - **Thiết kế Cơ khí & Phân bổ Trọng lượng (Smart Headband Form Factor):**
   - Khung cài tóc (Headband) in 3D rỗng ruột để luồn cáp nguồn/tín hiệu nối giữa 2 bên.
   - **Hộp Trái (Left Module - ~22g):** Chứa Mạch nguồn Buck Mini360, Mic INMP441, Cảm biến gia tốc MPU6050, Nút bấm Trigger (Trigger Button), Giắc cắm cáp nguồn rủ xuống túi quần (Pin Li-ion / Powerbank đặt trong túi).
-  - **Hộp Phải (Right Module - ~28g):** Chứa Bo mạch ESP32-S3-N16R8-CAM (hướng Camera OV2640 ra trước), Cảm biến siêu âm HC-SR04 (hướng ra trước, nghiêng chếch 15°), Loa Seeed Grove I2S Speaker (hướng về phía sau tai).
+  - **Hộp Phải (Right Module - ~28g):** Chứa Bo mạch ESP32-S3-N16R8-CAM (hướng Camera RHYX M21-45/GC2145 ra trước), Cảm biến siêu âm HC-SR04 (hướng ra trước, nghiêng chếch 15°), Loa Seeed Grove Speaker (hướng về phía sau tai).
 
 ---
 
@@ -17,11 +17,11 @@
 - **Giao thức:** Standard HTTP POST Request (`generateContent`).
 - **Phân công FreeRTOS Dual-Core:**
   - **Core 0 (Networking & HTTP):** Xử lý gửi HTTP POST payload (Ảnh JPEG + Audio PCM), nhận Stream Audio response từ Gemini API và đẩy vào RingBuffer trên PSRAM.
-  - **Core 1 (Hardware & DSP):** Xử lý đọc nút bấm Trigger, chụp ảnh OV2640, ghi âm Mic INMP441, đẩy âm thanh out Loa Seeed Grove I2S Speaker, đọc Siêu âm & MPU6050.
+  - **Core 1 (Hardware & DSP):** Xử lý đọc nút bấm Trigger, chụp ảnh RHYX M21-45 (GC2145 - RGB565), ghi âm Mic INMP441, đẩy âm thanh out Loa Seeed Grove Speaker, đọc Siêu âm & MPU6050.
 - **Workflow Ghi âm Động (Hold-to-Talk - Target Latency < 1.5s):**
   1. **User Hold Button:** Người dùng **bấm và giữ nút Trigger** -> Core 1 kích hoạt Mic INMP441 ghi âm linh hoạt (1s, 3s, 5s... tùy độ dài câu nói, timeout an toàn tối đa $8\text{s}$).
-  2. **User Release Button:** Người dùng **thả nút Trigger** -> Core 1 chụp ngay $1$ Frame SVGA ($800 \times 600$, JPEG Quality 10) từ Cam OV2640 và chốt file ghi âm.
-  3. **Fast Streaming Payload:** Core 0 đóng gói JPEG + File Audio vừa thu được thành JSON Payload gửi tới Gemini REST API.
+  2. **User Release Button:** Người dùng **thả nút Trigger** -> Core 1 chụp ngay $1$ Frame QVGA ($320 \times 240$, RGB565) từ Cam GC2145 và chốt file ghi âm. *(GC2145 không có JPEG → cần `esp_jpeg` encode trước khi upload Gemini.)*
+  3. **Fast Streaming Payload:** Core 0 đóng gói JPEG (encode từ RGB565) + File Audio vừa thu được thành JSON Payload gửi tới Gemini REST API.
   4. **Stream Response Playback (Cuốn chiếu):** Nhận Chunk Audio phản hồi -> Core 1 đẩy trực tiếp ra Loa Seeed Grove I2S Speaker.
   5. **Session Cleanup:** Hoàn tất -> Giải phóng PSRAM Buffer, trả CPU về IDLE.
 
@@ -61,8 +61,11 @@
 
 ## 3. HARDWARE PINOUT MAPPING (ESP32-S3-N16R8-CAM - Complete Hardware Set)
 
-### A. Camera OV2640 (Hộp Phải - FPC DVP Bus)
-- Chân cố định trên bo mạch ESP32-S3-CAM.
+### A. Camera RHYX M21-45 (GC2145, Hộp Phải - FPC DVP Bus)
+- **Sensor thực tế:** RHYX M21-45 = **GC2145** (2MP), **KHÔNG có JPEG encoder phần cứng**.
+- **Hệ quả:** `PIXFORMAT_JPEG` luôn fail với lỗi `0x106` (ESP_ERR_CAMERA_NOT_SUPPORTED). Chỉ xuất được **RGB565 / YUV422 / RAW** ở độ phân giải thấp (QVGA 320×240 / VGA).
+- **Pinout DVP cố định trên bo Freenove ESP32-S3 Cam (N16R8):** SIOD=4, SIOC=5, VSYNC=6, HREF=7, PCLK=13, XCLK=15, Y2=11, Y3=9, Y4=8, Y5=10, Y6=12, Y7=18, Y8=17, Y9=16.
+- **AI Pipeline (Chặng 3):** cần ảnh JPEG upload Gemini → phải convert RGB565→JPEG bằng phần mềm (`esp_jpeg`) hoặc thay sensor có JPEG. Chặng này tạm BLOCKED cho đến khi có bộ encode.
 
 ### B. Loa Seeed Grove I2S Speaker (Hộp Phải - I2S TX Channel 1)
 - **VCC:** 5V / 3.3V | **GND:** GND
@@ -93,7 +96,7 @@
 ## 4. TECHNICAL STACK & LIBRARIES (`platformio.ini`)
 - **Framework:** Arduino ESP32 Core (v3.x+)
 - **Target Board:** `esp32-s3-devkitc-1` (Flash: 16MB QIO, PSRAM: 8MB OPI)
-- **Libraries:** `esp32-camera`, `schreibfaul1/ESP32-audioI2S`, `bblanchon/ArduinoJson`, `HTTPClient`, `Adafruit_MPU6050`, `WiFiManager`, `WiFiMulti`.
+- **Libraries:** `esp32-camera` (trong Arduino core), `schreibfaul1/ESP32-audioI2S`, `bblanchon/ArduinoJson`, `HTTPClient`, `Adafruit_MPU6050`, `WiFiManager`, `WiFiMulti`.
 
 ---
 
@@ -115,7 +118,7 @@
 ---
 
 ## 6. ITERATIVE ROADMAP FOR AGENT
-- **Chặng 1 (Hardware Validation):** Code test độc lập Cam OV2640, Mic INMP441, Loa Seeed Grove I2S Speaker, Siêu âm HC-SR04, MPU6050, Nút bấm GPIO 14.
+- **Chặng 1 (Hardware Validation):** Code test độc lập Cam RHYX M21-45 (GC2145, RGB565), Mic INMP441, Loa Seeed Grove Speaker, Siêu âm HC-SR04, MPU6050, Nút bấm GPIO 14.
 - **Chặng 2 (Real-time Local Features & WiFi Management):** Lập trình tác vụ Core 1 (Siêu âm bíp bíp, Mic RMS Auto Volume, MPU6050 SOS) + Lập trình module Wi-Fi (WiFiMulti quét danh sách + WiFiManager Captive Portal AP fallback).
-- **Chặng 3 (Gemini HTTP REST Pipeline with Hold-to-Talk):** Bấm giữ nút -> Ghi âm Mic; Thả nút -> Chụp ảnh JPEG -> Gửi POST REST `models/gemini-2.5-flash` -> Stream Audio response ra Loa Seeed Grove I2S Speaker.
+- **Chặng 3 (Gemini HTTP REST Pipeline with Hold-to-Talk):** Bấm giữ nút -> Ghi âm Mic; Thả nút -> Chụp ảnh (GC2145: RGB565 → cần `esp_jpeg` encode JPEG) -> Gửi POST REST `models/gemini-2.5-flash` -> Stream Audio response ra Loa Seeed Grove Speaker.
 - **Chặng 4 (Integration & Latency Tuning):** Ghép toàn bộ mô-đun, tinh chỉnh độ trễ phản hồi Gemini $< 1.5\text{s}$.

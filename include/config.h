@@ -8,6 +8,8 @@
 // ============================================================
 
 // Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
+// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> AI pipeline must use RGB565
+//       capture + software JPEG encode (TBD) or a JPEG-capable sensor.
 // #define ENABLE_CAMERA_OV2640
 // #define ENABLE_SPEAKER_I2S
 
@@ -23,7 +25,15 @@
 // #define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
 // #define ENABLE_MPU6050_TEST
-#define ENABLE_MOTION_ULTRA_TEST
+// #define ENABLE_MOTION_ULTRA_TEST
+
+// Camera web-stream test (ESP32-S3-CAM, sensor RHYX M21-45/GC2145):
+//   http://<IP> -> captures RGB565 frame, serves as BMP (GC2145 has no JPEG)
+#define ENABLE_CAMERA
+
+// Mic -> Gemini AI -> Google TTS -> Grove Speaker (full flow test)
+// Bắt buộc kèm #define ENABLE_TTS_CLOUD ở trên
+// #define ENABLE_MIC_AI_TEST
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
@@ -38,24 +48,30 @@
 // #define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
 
 // ============================================================
-// CAMERA OV2640 - DVP Bus (Right Module - FPC DVP Bus)
+// CAMERA - RHYX M21-45 (GC2145, 2MP) - DVP Bus (Right Module - FPC DVP Bus)
 // Dedicated DVP Pins on ESP32-S3 Cam board
+// Pinout verified for Freenove ESP32-S3 Cam (N16R8):
+//   SIOD=4 SIOC=5 VSYNC=6 HREF=7 PCLK=13 XCLK=15
+//   Y2=11 Y3=9 Y4=8 Y5=10 Y6=12 Y7=18 Y8=17 Y9=16
+// NOTE: GPIO40 = SD DATA0 (pull-ups of SD slot) - do NOT use for speaker
+// NOTE: GC2145 has NO hardware JPEG encoder -> PIXFORMAT_JPEG fails with 0x106.
+//       Must use PIXFORMAT_RGB565 (or YUV422) at low resolution (QVGA/VGA).
 // ============================================================
 #define CAM_PWDN          -1
 #define CAM_RESET         -1
-#define CAM_XCLK          10
+#define CAM_XCLK          15
 #define CAM_SIOD           4   // SDA
 #define CAM_SIOC           5   // SCL
 #define CAM_Y9            16
 #define CAM_Y8            17
 #define CAM_Y7            18
 #define CAM_Y6            12
-#define CAM_Y5            11
-#define CAM_Y4             6
-#define CAM_Y3             7
-#define CAM_Y2            15
-#define CAM_VSYNC         38
-#define CAM_HREF          21
+#define CAM_Y5            10
+#define CAM_Y4             8
+#define CAM_Y3             9
+#define CAM_Y2            11
+#define CAM_VSYNC          6
+#define CAM_HREF           7
 #define CAM_PCLK          13
 
 // ============================================================
@@ -67,11 +83,16 @@
 #define MIC_DATA_IN        2  // SD
 
 // ============================================================
-// SPEAKER - Seeed Grove I2S / PCM5102A (Right Module - I2S TX Ch 1)
+// SPEAKER - Seeed Grove Speaker (4 chân: VDD, GND, SIG, NC)
+// Loa nhận tín hiệu PWM/analog trên chân SIG (ESP32-S3 không có DAC)
+// Dùng LEDC PWM (channel 2, timer 1) để không xung đột camera
+// (camera đang dùng LEDC_CHANNEL_0 / LEDC_TIMER_0 cho XCLK)
+//
+// LƯU Ý: GPIO40 trên board Freenove N16R8 là SD DATA0 (có pull-up
+// khe thẻ SD) -> loa rè liên tục. Đã chuyển sang GPIO21 (tự do sau
+// khi sửa camera pinout: cũ là CAM_HREF).
 // ============================================================
-#define SPK_BCLK           1  // BCLK
-#define SPK_LRCK           3  // WS (LRCK)
-#define SPK_DATA_OUT      40  // DIN
+#define SPK_PWM_PIN        21  // nối vào chân SIG của Grove Speaker
 
 // ============================================================
 // TRIGGER BUTTON (Hỏi AI / Hủy SOS) - Hộp Trái
@@ -86,7 +107,7 @@
 #define ULTRASONIC_ECHO    9
 
 // ============================================================
-// MPU6050 - I2C (Left Module - Wire through Headband)
+// MPU6050 - I2C (Left Module - Wire     Headband)
 // GPIO48 is the onboard LED — moved SCL to a free pin.
 // ============================================================
 #define MPU_SDA           47

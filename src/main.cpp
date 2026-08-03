@@ -57,7 +57,7 @@ static void check_factory_reset(void) {
 // ============================================================
 // SETUP — excluded when standalone test flag is active
 // ============================================================
-#if !defined(ENABLE_API_TEST) && !defined(ENABLE_MIC_TEST) && !defined(ENABLE_SPEAKER_TEST) && !defined(ENABLE_ULTRASONIC_TEST) && !defined(ENABLE_MPU6050_TEST) && !defined(ENABLE_MOTION_ULTRA_TEST) && !defined(ENABLE_CAMERA)
+#if !defined(ENABLE_API_TEST) && !defined(ENABLE_MIC_TEST) && !defined(ENABLE_SPEAKER_TEST) && !defined(ENABLE_ULTRASONIC_TEST) && !defined(ENABLE_MPU6050_TEST) && !defined(ENABLE_MOTION_ULTRA_TEST) && !defined(ENABLE_MIC_AI_TEST) && !defined(ENABLE_CAMERA)
 void setup() {
     initSerial();
     checkPSRAM();

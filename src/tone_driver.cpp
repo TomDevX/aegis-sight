@@ -1,10 +1,22 @@
 #include "tone_driver.h"
 #include <math.h>
 #include <string.h>
+#include "driver/ledc.h"
 
 #define TONE_QUEUE_SIZE    8
 #define TONE_TASK_STACK    4096
 #define TONE_TASK_PRIO     3
+
+// --- PWM output: Seeed Grove Speaker (SIG = PWM, ESP32-S3 has no DAC) ---
+#define PWM_CHANNEL        2    // camera uses LEDC_CHANNEL_0 / LEDC_TIMER_0
+#define PWM_RES_BITS       10
+#define PWM_RES_MAX        ((1 << PWM_RES_BITS) - 1)  // 1023
+#define PWM_CARRIER_HZ     78125                       // 80MHz / 2^10
+#define PWM_DC_MID         (PWM_RES_MAX / 2)           // ~silence
+
+// 1000000 / TONE_SAMPLE_RATE = 62.5us -> alternate 62/63 per sample
+#define SAMPLE_PERIOD_US_LO   62
+#define SAMPLE_PERIOD_US_HI   63
 
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;
@@ -20,37 +32,52 @@ static volatile size_t streamReadIdx  = 0;
 static size_t streamCapacity = 0;
 static volatile bool streamActive = false;
 
+static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
+
+static uint32_t ledcFreqHz = 0;
+
+// Ép clock APB 80MHz. Nếu để AUTO, driver có thể chọn XTAL 40MHz -> 10-bit
+// @ 78.125kHz vượt giới hạn -> ledcSetup fail -> loa phát rác rè rè.
+static bool ledc_set_freq(uint32_t f) {
+    ledc_timer_config_t timer = {};
+    timer.speed_mode = LEDC_LOW_SPEED_MODE;
+    timer.timer_num = (ledc_timer_t)LEDC_TIMER_1;
+    timer.duty_resolution = (ledc_timer_bit_t)PWM_RES_BITS;
+    timer.freq_hz = f;
+    timer.clk_cfg = LEDC_USE_APB_CLK;
+    return ledc_timer_config(&timer) == ESP_OK;
+}
+
+static void set_ledc_freq(uint32_t f) {
+    if (ledcFreqHz != f) {
+        ledc_set_freq(f);
+        ledcFreqHz = f;
+    }
+}
+
+// Play int16 PCM through PWM, paced at TONE_SAMPLE_RATE.
+// checkStop (optional): abort early when true.
+static void pwm_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
+    set_ledc_freq(PWM_CARRIER_HZ);
+    int64_t next = esp_timer_get_time();
+    for (uint32_t i = 0; i < samples; i++) {
+        if (checkStop && checkStop()) break;
+        int32_t d = PWM_DC_MID + ((int32_t)buf[i] >> (16 - PWM_RES_BITS));
+        if (d < 0) d = 0;
+        else if (d > PWM_RES_MAX) d = PWM_RES_MAX;
+        ledcWrite(PWM_CHANNEL, (uint32_t)d);
+        next += (i & 1) ? SAMPLE_PERIOD_US_HI : SAMPLE_PERIOD_US_LO;
+        while (esp_timer_get_time() < next) {}
+    }
+}
+
 bool tone_driver_init(void) {
-    i2s_config_t i2s_cfg = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = TONE_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 256,
-        .use_apll = false,
-    };
-
-    i2s_pin_config_t pin_cfg = {
-        .bck_io_num = SPK_BCLK,
-        .ws_io_num = SPK_LRCK,
-        .data_out_num = SPK_DATA_OUT,
-        .data_in_num = I2S_PIN_NO_CHANGE,
-    };
-
-    esp_err_t err = i2s_driver_install(I2S_SPK_PORT, &i2s_cfg, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.printf("[TONE] i2s_driver_install failed: 0x%x\n", err);
-        return false;
+    if (!ledc_set_freq(PWM_CARRIER_HZ)) {
+        Serial.printf("[TONE] PWM timer config failed (%dHz) -> speaker may be noisy\n", PWM_CARRIER_HZ);
     }
-
-    err = i2s_set_pin(I2S_SPK_PORT, &pin_cfg);
-    if (err != ESP_OK) {
-        Serial.printf("[TONE] i2s_set_pin failed: 0x%x\n", err);
-        return false;
-    }
+    ledcAttachPin(SPK_PWM_PIN, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 0);   // duty 0 = im lặng (50% sẽ rè rè liên tục trên Grove amp)
+    ledcFreqHz = PWM_CARRIER_HZ;
 
     toneBuf = (int16_t *)ps_malloc(TONE_BUF_SAMPLES * sizeof(int16_t));
     if (!toneBuf) {
@@ -64,27 +91,9 @@ bool tone_driver_init(void) {
         return false;
     }
 
-    Serial.printf("[TONE] I2S TX init OK (port=%d, buf=%d samples on PSRAM)\n",
-                  I2S_SPK_PORT, TONE_BUF_SAMPLES);
+    Serial.printf("[TONE] PWM speaker ready (pin=%d, ch=%d, %d-bit @ %dHz)\n",
+                  SPK_PWM_PIN, PWM_CHANNEL, PWM_RES_BITS, PWM_CARRIER_HZ);
     return true;
-}
-
-static void generate_tone_chunk(int16_t *buf, uint32_t samples,
-                                 uint16_t freq, uint8_t vol) {
-    static uint32_t phase = 0;
-    float amplitude = (vol / 21.0f) * 16000.0f;
-
-    if (freq == 0) {
-        memset(buf, 0, samples * sizeof(int16_t));
-        return;
-    }
-
-    for (uint32_t i = 0; i < samples; i++) {
-        float t = (float)phase / TONE_SAMPLE_RATE;
-        buf[i] = (int16_t)(amplitude * sinf(2.0f * M_PI * freq * t));
-        phase++;
-    }
-    phase %= TONE_SAMPLE_RATE;
 }
 
 static void tone_task(void *pvParameters) {
@@ -100,9 +109,7 @@ static void tone_task(void *pvParameters) {
                     toneBuf[i] = (int16_t)(streamBuf[streamReadIdx] * volScale);
                     streamReadIdx = (streamReadIdx + 1) % streamCapacity;
                 }
-                size_t bytesWritten = 0;
-                i2s_write(I2S_SPK_PORT, toneBuf, toRead * sizeof(int16_t),
-                          &bytesWritten, pdMS_TO_TICKS(50));
+                pwm_output(toneBuf, toRead, stop_check_stream);
                 continue;
             }
             if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -117,30 +124,19 @@ play_tone:
             tonePlaying = true;
             toneStopFlag = false;
 
-            uint32_t totalSamples = (uint32_t)TONE_SAMPLE_RATE * req.durationMs / 1000;
-            uint32_t written = 0;
+            // Sóng vuông tần số = req.freqHz: sạch & to trên Grove Speaker
+            set_ledc_freq(req.freqHz);
+            uint32_t pct = 5 + (45u * req.volume) / 21u;   // 5..50% duty
+            ledcWrite(PWM_CHANNEL, (uint32_t)1023u * pct / 100u);
 
-            while (written < totalSamples && !toneStopFlag) {
-                if (streamActive) {
-                    tonePlaying = false;
-                    break;
-                }
-                uint32_t chunk = totalSamples - written;
-                if (chunk > TONE_BUF_SAMPLES) chunk = TONE_BUF_SAMPLES;
-
-                generate_tone_chunk(toneBuf, chunk, req.freqHz, req.volume);
-
-                size_t bytesWritten = 0;
-                i2s_write(I2S_SPK_PORT, toneBuf, chunk * sizeof(int16_t),
-                          &bytesWritten, pdMS_TO_TICKS(50));
-                written += bytesWritten / sizeof(int16_t);
+            uint32_t t0 = millis();
+            while (millis() - t0 < req.durationMs) {
+                if (toneStopFlag || streamActive) break;
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
 
-            memset(toneBuf, 0, TONE_BUF_SAMPLES * sizeof(int16_t));
-            size_t silenceWritten = 0;
-            i2s_write(I2S_SPK_PORT, toneBuf, TONE_BUF_SAMPLES * sizeof(int16_t),
-                      &silenceWritten, pdMS_TO_TICKS(50));
-
+            set_ledc_freq(PWM_CARRIER_HZ);
+            ledcWrite(PWM_CHANNEL, 0);   // tắt hẳn sau bíp, tránh rè rè
             tonePlaying = false;
         }
     }

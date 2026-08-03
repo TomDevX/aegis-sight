@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include "config.h"
-#include "driver/i2s.h"
+#include "esp_timer.h"
 
 #define TONE_SAMPLE_RATE  16000
 #define TONE_BITS         16

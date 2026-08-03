@@ -1,16 +1,71 @@
 #include <Arduino.h>
-#include "config.h"
+#include <WiFi.h>
+#include <Wire.h>
 #include "esp_camera.h"
+#include "esp_http_server.h"
+#include "config.h"
+#include "img_converters.h"
 
 #ifdef ENABLE_CAMERA
-// ============================================================
-// Camera Test - Chụp JPEG 1600x1200, lưu PSRAM, in dung lượng
-// Kích hoạt: bỏ comment #define ENABLE_CAMERA trong config.h
-//             và comment #define ENABLE_CAMERA_OV2640 để tránh
-//             conflict setup/loop với main.cpp
-// ============================================================
 
-static bool initCameraTest(void) {
+const char* ssid = "Umapyoi";
+const char* password = "dokidoki1@";
+
+httpd_handle_t stream_httpd = NULL;
+
+static esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
+    int64_t t_start = esp_timer_get_time();
+
+    // 1. Chụp frame RGB565 thô từ PSRAM
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    uint8_t *jpg_buf = NULL;
+    size_t jpg_len = 0;
+
+    // 2. Nén JPEG với Quality = 65 (Tối ưu tốc độ, file SVGA nén ra vẫn cực nhẹ)
+    bool converted = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 50, &jpg_buf, &jpg_len);
+    esp_camera_fb_return(fb); 
+
+    if (!converted) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // 3. Phản hồi luồng Byte JPEG về client/AI
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    esp_err_t res = httpd_resp_send(req, (const char *)jpg_buf, jpg_len);
+
+    int64_t t_end = esp_timer_get_time();
+    Serial.printf("[SPEED] Size: %d Bytes | Time: %d ms\n", 
+                  (int)jpg_len, (int)((t_end - t_start) / 1000));
+
+    free(jpg_buf);
+    return res;
+}
+
+void startCameraServer() {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+
+    httpd_uri_t capture_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = jpg_stream_httpd_handler,
+        .user_ctx  = NULL
+    };
+
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &capture_uri);
+    }
+}
+
+static bool initCamera() {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
@@ -30,94 +85,61 @@ static bool initCameraTest(void) {
     config.pin_sccb_scl = CAM_SIOC;
     config.pin_pwdn     = CAM_PWDN;
     config.pin_reset    = CAM_RESET;
-    config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG;
-
-    // 1600x1200 (UXGA) bắt buộc dùng PSRAM cho frame buffer
-    config.frame_size   = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count     = 1;
+    
+    config.xclk_freq_hz = 15000000;       // Xung nhịp an toàn cho SVGA (16MHz)
+    config.pixel_format = PIXFORMAT_RGB565; 
+    config.frame_size   = FRAMESIZE_SVGA; // 800x600 mở rộng góc nhìn
+    config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
+    // 1. Khởi tạo camera trước
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        Serial.printf("[CAM_TEST] Init failed: 0x%x\n", err);
         return false;
     }
 
+    // 2. Lấy con trỏ cảm biến SAU KHI đã khởi tạo thành công để cấu hình phơi sáng
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_brightness(s, 0);
-        s->set_saturation(s, 0);
+        s->set_exposure_ctrl(s, 0); // Tắt auto exposure
+        s->set_aec_value(s, 300);   // Cố định mức phơi sáng
+        s->set_gain_ctrl(s, 0);     // Tắt auto gain
+        s->set_agc_gain(s, 0);      // Cố định gain thấp
     }
+
     return true;
 }
 
-static void captureAndReport(void) {
-    Serial.println("[CAM_TEST] Capturing 1600x1200 JPEG...");
-
-    unsigned long tStart = millis();
-    camera_fb_t *fb = esp_camera_fb_get();
-    unsigned long tElapsed = millis() - tStart;
-
-    if (!fb) {
-        Serial.println("[CAM_TEST] Capture FAILED!");
-        return;
-    }
-
-    Serial.printf("[CAM_TEST] Capture OK in %lu ms\n", tElapsed);
-    Serial.printf("[CAM_TEST] Resolution : %dx%d\n", fb->width, fb->height);
-    Serial.printf("[CAM_TEST] JPEG size  : %u bytes (%.2f KB)\n",
-                  fb->len, fb->len / 1024.0f);
-    Serial.printf("[CAM_TEST] Buffer addr: %p (PSRAM: %s)\n",
-                  fb->buf,
-                  psramFound() ? "yes" : "no");
-
-    // Kiểm tra buffer có nằm trong vùng PSRAM không
-    if (psramFound()) {
-        uint32_t psramStart = 0x3C000000;
-        uint32_t psramEnd   = psramStart + ESP.getPsramSize();
-        uint32_t bufAddr    = (uint32_t)fb->buf;
-        bool inPsram = (bufAddr >= psramStart && bufAddr < psramEnd);
-        Serial.printf("[CAM_TEST] Buffer in PSRAM region: %s\n",
-                      inPsram ? "YES" : "NO");
-    }
-
-    esp_camera_fb_return(fb);
-}
-
 void setup() {
+    pinMode(SPK_PWM_PIN, OUTPUT);
+    digitalWrite(SPK_PWM_PIN, LOW);
+
     Serial.begin(SERIAL_BAUD);
     delay(500);
-    Serial.println("\n========================================");
-    Serial.println("  CAMERA TEST - OV2640 UXGA 1600x1200");
-    Serial.println("========================================\n");
 
-    // Kiểm tra PSRAM
     if (!psramFound()) {
-        Serial.println("[CAM_TEST] FATAL: No PSRAM! UXGA needs PSRAM.");
+        Serial.println("[CAM] Khong tim thay PSRAM!");
         return;
     }
-    Serial.printf("[CAM_TEST] PSRAM: %d KB free\n",
-                  ESP.getFreePsram() / 1024);
 
-    if (!initCameraTest()) {
-        Serial.println("[CAM_TEST] Camera init failed, halting.");
+    if (!initCamera()) {
+        Serial.println("[CAM] Init Fail!");
         return;
     }
-    Serial.println("[CAM_TEST] Camera OV2640 initialized OK");
 
-    // Chụp ảnh
-    captureAndReport();
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(200);
+    }
 
-    Serial.println("\n========================================");
-    Serial.println("  TEST COMPLETE - Entering idle loop");
-    Serial.println("========================================");
+    startCameraServer();
+    Serial.print("Ready: http://");
+    Serial.println(WiFi.localIP());
 }
 
 void loop() {
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
-#endif // ENABLE_CAMERA
+#endif
