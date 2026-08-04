@@ -165,7 +165,7 @@ void setup() {
 
     Serial.println("\n=== THỬ NGHIỆM LOA GROVE - GOOGLE TRANSLATE TTS ===");
 
-    WiFi.begin("Homepro", "Sunny20061@3");
+    WiFi.begin("HCMUT.EDU", "Suong72730109");
     Serial.print("Đang kết nối WiFi");
     while (WiFi.status() != WL_CONNECTED) {
         delay(200);

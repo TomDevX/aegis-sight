@@ -8,8 +8,8 @@
 
 #ifdef ENABLE_CAMERA
 
-const char* ssid = "Homepro";
-const char* password = "Sunny20061@3";
+const char* ssid = "HCMUT.EDU";
+const char* password = "Suong72730109";
 
 httpd_handle_t stream_httpd = NULL;
 
@@ -27,7 +27,7 @@ static esp_err_t jpg_stream_httpd_handler(httpd_req_t *req) {
     size_t jpg_len = 0;
 
     // 2. Nén JPEG với Quality = 20
-    bool converted = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 20, &jpg_buf, &jpg_len);
+    bool converted = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, PIXFORMAT_RGB565, 60, &jpg_buf, &jpg_len);
     esp_camera_fb_return(fb); 
 
     if (!converted) {
@@ -102,22 +102,22 @@ static bool initCamera() {
     sensor_t *s = esp_camera_sensor_get();
     // 2. Lấy con trỏ cảm biến SAU KHI đã khởi tạo thành công để cấu hình phơi sáng
     // mode: stable
-    if (s) {
-        s->set_exposure_ctrl(s, 0); // Tắt auto exposure
-        s->set_aec_value(s, 300);   // Cố định mức phơi sáng
-        s->set_gain_ctrl(s, 0);     // Tắt auto gain
-        s->set_agc_gain(s, 0);      // Cố định gain thấp
-    }
+    // if (s) {
+    //     s->set_exposure_ctrl(s, 0); // Tắt auto exposure
+    //     s->set_aec_value(s, 300);   // Cố định mức phơi sáng
+    //     s->set_gain_ctrl(s, 0);     // Tắt auto gain
+    //     s->set_agc_gain(s, 0);      // Cố định gain thấp
+    // }
 
     // mode: environment adaptable. Giờ tôi 
-    // if (s) {
-    //     s->set_exposure_ctrl(s, 1);   // Bật Auto Exposure (AEC)
-    //     s->set_gain_ctrl(s, 1);       // Bật Auto Gain (AGC)
-    //     s->set_whitebal(s, 1);             // Bật Auto White Balance (cân bằng trắng tự động để màu sắc chuẩn xác)
-    //     s->set_aec2(s, 1);            // Bật thuật toán AEC DSP giúp chống lóa sáng mạnh
-    //     s->set_brightness(s, 1);      // Tăng nhẹ độ sáng (tuỳ chọn)
-    //     s->set_contrast(s, 1);        // Tăng nhẹ tương phản để viền chữ nổi bật hơn cho AI
-    // }
+    if (s) {
+        s->set_exposure_ctrl(s, 1);   // Bật Auto Exposure (AEC)
+        s->set_gain_ctrl(s, 1);       // Bật Auto Gain (AGC)
+        s->set_whitebal(s, 1);             // Bật Auto White Balance (cân bằng trắng tự động để màu sắc chuẩn xác)
+        s->set_aec2(s, 1);                // Bật thuật toán AEC DSP giúp chống lóa sáng mạnh
+        // s->set_brightness(s, 1);      // Tăng nhẹ độ sáng (tuỳ chọn)
+        // s->set_contrast(s, 1);        // Tăng nhẹ tương phản để viền chữ nổi bật hơn cho AI
+    }
 
     return true;
 }

@@ -22,7 +22,8 @@
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
 // #define ENABLE_MIC_TEST
-#define ENABLE_SPEAKER_TEST
+// #define ENABLE_MIC_SPEAKER_TEST   // INMP441 -> Grove Speaker (echo test, PWM)
+// #define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
 // #define ENABLE_MPU6050_TEST
 // #define ENABLE_MOTION_ULTRA_TEST
@@ -34,6 +35,10 @@
 // Mic -> Gemini AI -> Google TTS -> Grove Speaker (full flow test)
 // Bắt buộc kèm #define ENABLE_TTS_CLOUD ở trên
 // #define ENABLE_MIC_AI_TEST
+
+// Mic + Camera (image + audio) -> Gemini AI -> Google TTS -> Grove Speaker
+// Chỉ bật 1 test flag tại 1 thời điểm
+#define ENABLE_MIC_AI_CAM_TEST
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
