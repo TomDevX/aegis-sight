@@ -40,6 +40,7 @@ Everything is modular via `#define` / `#ifdef`. Comment a flag to exclude that f
 
 ### Standalone test flags (Chặng 1 — one at a time)
 - `ENABLE_MIC_TEST`, `ENABLE_SPEAKER_TEST`, `ENABLE_ULTRASONIC_TEST`, `ENABLE_MPU6050_TEST`
+- `ENABLE_MIC_AI_TEST` (mic → Gemini → TTS), `ENABLE_MIC_AI_CAM_TEST` (mic + camera image → Gemini → TTS), `ENABLE_CAMERA` (RGB565 web-stream)
 
 Each has its own `setup()`/`loop()` and **will conflict** with `main.cpp`. To run a test:
 1. Comment out ALL main pipeline flags

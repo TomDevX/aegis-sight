@@ -6,6 +6,7 @@
 #include "driver/i2s.h"
 #include "esp_camera.h"
 #include "img_converters.h"
+#include "mbedtls/base64.h" // Thư viện Base64 chuẩn của ESP-IDF
 
 #if defined(ENABLE_MIC_AI_CAM_TEST)
 
@@ -24,8 +25,8 @@
 
 #define RECORD_TIME_SEC       3
 #define AUDIO_GAIN            2.0f
-#define JPEG_QUALITY          70               // Nén JPEG phần mềm (fmt2jpg)
-#define TARGET_GEMINI_MODEL   "gemini-3.1-flash-lite"
+#define JPEG_QUALITY          70
+#define TARGET_GEMINI_MODEL   "gemini-3.5-flash-lite"
 
 // ============================================================================
 #define TOTAL_SAMPLES         (AI_AUDIO_SAMPLE_RATE * RECORD_TIME_SEC)
@@ -255,8 +256,8 @@ static bool initCamera() {
     config.pin_reset    = CAM_RESET;
 
     config.xclk_freq_hz = 15000000;
-    config.pixel_format = PIXFORMAT_RGB565;   // GC2145 không có JPEG hardware
-    config.frame_size   = FRAMESIZE_QVGA;     // 320x240: đủ nhỏ cho upload nhanh
+    config.pixel_format = PIXFORMAT_RGB565;   
+    config.frame_size   = FRAMESIZE_QVGA;     // 320x240
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -269,10 +270,10 @@ static bool initCamera() {
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_exposure_ctrl(s, 1);   // Auto Exposure
-        s->set_gain_ctrl(s, 1);       // Auto Gain
-        s->set_whitebal(s, 1);        // Auto White Balance
-        s->set_aec2(s, 1);            // Chống lóa sáng
+        s->set_exposure_ctrl(s, 1);   
+        s->set_gain_ctrl(s, 1);       
+        s->set_whitebal(s, 1);        
+        s->set_aec2(s, 1);            
     }
     Serial.println("[CAM] Camera khởi tạo thành công (QVGA RGB565)");
     return true;
@@ -282,6 +283,12 @@ static bool initCamera() {
 // 6. CHỤP ẢNH VÀ NÉN JPEG PHẦN MỀM (fmt2jpg)
 // ============================================================
 static bool captureJpeg() {
+    if (jpgBuf) {
+        free(jpgBuf);
+        jpgBuf = NULL;
+        jpgLen = 0;
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         Serial.println("[CAM] Lỗi esp_camera_fb_get!");
@@ -303,43 +310,25 @@ static bool captureJpeg() {
 }
 
 // ============================================================
-// 7. MÃ HÓA BASE64 (PSRAM, bỏ padding '=' - Gemini chấp nhận)
+// 7. MÃ HÓA BASE64 CHUẨN (SỬ DỤNG MBEDTLS AN TOÀN TUYỆT ĐỐI)
 // ============================================================
-static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 static bool base64Encode(const uint8_t *data, size_t length, uint8_t **outBuf, size_t *outLen) {
-    size_t full = ((length + 2) / 3) * 4;
-    size_t padCount = (3 - (length % 3)) % 3;
-    *outLen = full - padCount;
+    if (!data || length == 0) return false;
 
-    uint8_t *buf = (uint8_t *)ps_malloc(*outLen + 1);
+    size_t expected_len = ((length + 2) / 3) * 4 + 1;
+    uint8_t *buf = (uint8_t *)ps_malloc(expected_len);
     if (!buf) return false;
 
-    size_t o = 0;
-    size_t i = 0;
-    uint8_t a3[3];
-
-    while (length--) {
-        a3[i++] = *(data++);
-        if (i == 3) {
-            buf[o++] = base64_chars[(a3[0] & 0xfc) >> 2];
-            buf[o++] = base64_chars[((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4)];
-            buf[o++] = base64_chars[((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6)];
-            buf[o++] = base64_chars[a3[2] & 0x3f];
-            i = 0;
-        }
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode(buf, expected_len, &olen, data, length);
+    if (ret != 0) {
+        free(buf);
+        return false;
     }
 
-    if (i) {
-        for (size_t j = i; j < 3; j++) a3[j] = 0;
-        buf[o++] = base64_chars[(a3[0] & 0xfc) >> 2];
-        buf[o++] = base64_chars[((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4)];
-        if (i > 1) {
-            buf[o++] = base64_chars[((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6)];
-        }
-    }
-
-    buf[*outLen] = '\0';
+    buf[olen] = '\0';
+    *outBuf = buf;
+    *outLen = olen;
     return true;
 }
 
@@ -404,16 +393,18 @@ static void playGoogleTTS(String text, String lang = "vi") {
 }
 
 // ============================================================
-// 9. STREAM BASE64 TỪ PSRAM LÊN SOCKET SSL (Chunk 1024 bytes)
+// 9. STREAM BASE64 TỪ PSRAM LÊN SOCKET SSL (KÈM KIỂM TRA NULL)
 // ============================================================
 static bool streamToClient(WiFiClientSecure &client, const uint8_t *data, size_t len) {
+    if (!data || len == 0) return false; // Chống crash LoadProhibited
+
     size_t offset = 0;
     while (offset < len) {
         size_t chunk = (len - offset > 1024) ? 1024 : (len - offset);
         size_t written = client.write(data + offset, chunk);
         if (written == 0) return false;
         offset += written;
-        vTaskDelay(pdMS_TO_TICKS(15)); // Cho WiFi & SSL Stack xả đệm
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
     return true;
 }
@@ -442,7 +433,7 @@ static String sendAudioImageToGemini() {
         return "";
     }
 
-    // 1. Tạo WAV 2 giây từ PCM đã thu (giữ nguyên logic của mic_ai_test)
+    // 1. Tạo WAV 2 giây từ PCM
     size_t rawPcmSize = (AI_AUDIO_SAMPLE_RATE * 2) * sizeof(int16_t);
     size_t pcmSize = (rawPcmSize / 3) * 3;
     size_t wavSize = WAV_HEADER_SIZE + pcmSize;
@@ -462,7 +453,7 @@ static String sendAudioImageToGemini() {
     createWavHeader(wavBuf, pcmSize, AI_AUDIO_SAMPLE_RATE, 1, 16);
     memcpy(wavBuf + WAV_HEADER_SIZE, audioRecordBuf, pcmSize);
 
-    // 2. Mã hóa WAV -> Base64 (PSRAM)
+    // 2. Mã hóa WAV -> Base64
     Serial.println("[2/3] Đang mã hóa WAV sang Base64...");
     uint8_t *audB64 = NULL; size_t audB64Len = 0;
     if (!base64Encode(wavBuf, wavSize, &audB64, &audB64Len)) {
@@ -473,7 +464,7 @@ static String sendAudioImageToGemini() {
     }
     free(wavBuf);
 
-    // 3. Mã hóa Ảnh JPEG -> Base64 (PSRAM)
+    // 3. Mã hóa Ảnh JPEG -> Base64
     Serial.println("[2/3] Đang mã hóa Ảnh JPEG sang Base64...");
     uint8_t *imgB64 = NULL; size_t imgB64Len = 0;
     if (!base64Encode(jpgBuf, jpgLen, &imgB64, &imgB64Len)) {
@@ -482,13 +473,12 @@ static String sendAudioImageToGemini() {
         client.stop();
         return "";
     }
-    free(jpgBuf); jpgBuf = NULL;
 
-    // 4. Đóng gói JSON (text + image + audio)
+    // 4. Đóng gói JSON
     String jsonHeader = "{\"contents\":[{\"parts\":["
-                        "{\"text\":\"Bạn là trợ lý người mù. Hãy nhìn hình ảnh và nghe âm thanh, trả lời ngắn gọn dưới 20 từ bằng tiếng Việt.\"},"
+                        "{\"text\":\"Bạn là trợ lý người mù. Hãy nhìn hình ảnh và nghe âm thanh câu hỏi, trả lời ngắn gọn dưới 100 từ bằng tiếng Việt.\"},"
                         "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
-    String jsonMid     = "\"},{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
+    String jsonMid     = "\"}},{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
     String jsonFooter  = "\"}}]}]}";
 
     size_t totalContentLength = jsonHeader.length() + imgB64Len + jsonMid.length() + audB64Len + jsonFooter.length();
@@ -501,7 +491,7 @@ static String sendAudioImageToGemini() {
     client.printf("Content-Length: %zu\r\n", totalContentLength);
     client.printf("Connection: close\r\n\r\n");
 
-    // 6. Stream từng phần JSON lên server
+    // 6. Stream JSON
     Serial.printf("[2/3] Đang stream Ảnh(%u) + Audio(%u) lên Google Server...\n",
                   (unsigned)imgB64Len, (unsigned)audB64Len);
 
@@ -522,8 +512,7 @@ static String sendAudioImageToGemini() {
         return "";
     }
 
-    // 7. Nhận phản hồi (header HTTP + body). Server đóng TLS ngay sau khi gửi xong
-    //    vì client gửi "Connection: close" — lỗi SSL (-76) chỉ là close_notify.
+    // 7. Nhận phản hồi từ Google
     unsigned long startWait = millis();
     while (!client.available() && (millis() - startWait < 20000)) {
         delay(100);
@@ -535,7 +524,6 @@ static String sendAudioImageToGemini() {
         return "";
     }
 
-    // Đọc hết bytes còn lại trong buffer (kể cả sau khi TLS báo đóng)
     String responseBody = "";
     startWait = millis();
     while ((client.connected() || client.available()) && (millis() - startWait < 12000)) {
@@ -548,40 +536,41 @@ static String sendAudioImageToGemini() {
     }
     client.stop();
 
-    // Gemini trả HTTP/1.1 chunked transfer-encoding -> body thô chứa dòng
-    // độ dài (318) và CRLF quanh JSON. Chỉ lấy phần nằm giữa `{` đầu và `}` cuối.
+    // 8. Parse JSON & Trích xuất câu trả lời
+    String replyStr = "";
     int jsonStart = responseBody.indexOf('{');
     int jsonEnd = responseBody.lastIndexOf('}');
-    if (jsonStart < 0 || jsonEnd <= jsonStart) {
-        Serial.printf("[2/3] Không tìm thấy JSON trong phản hồi (len=%u)\n", responseBody.length());
-        Serial.println(responseBody);
-        return "";
-    }
-    String jsonPayload = responseBody.substring(jsonStart, jsonEnd + 1);
-
-    // 8. Parse JSON
-    JsonDocument respDoc;
-    DeserializationError error = deserializeJson(respDoc, jsonPayload);
-    if (error) {
-        Serial.printf("[2/3] Lỗi Parse JSON: %s\n", error.c_str());
-        Serial.println(jsonPayload);
-        return "";
+    
+    if (jsonStart >= 0 && jsonEnd > jsonStart) {
+        String jsonPayload = responseBody.substring(jsonStart, jsonEnd + 1);
+        JsonDocument respDoc;
+        DeserializationError error = deserializeJson(respDoc, jsonPayload);
+        
+        if (!error && !respDoc["candidates"][0]["content"]["parts"][0]["text"].isNull()) {
+            replyStr = respDoc["candidates"][0]["content"]["parts"][0]["text"].as<String>();
+        }
     }
 
-    if (!respDoc["error"].isNull()) {
-        const char *errMessage = respDoc["error"]["message"];
-        Serial.printf("[2/3] Gemini API Error: %s\n", errMessage ? errMessage : "Unknown Error");
-        return "";
+    // Fallback Regex/String Search nếu JSON dính Chunk
+    if (replyStr.length() == 0) {
+        int textIdx = responseBody.indexOf("\"text\":");
+        if (textIdx != -1) {
+            int startQuote = responseBody.indexOf("\"", textIdx + 7);
+            int endQuote = responseBody.indexOf("\"", startQuote + 1);
+            if (startQuote != -1 && endQuote != -1) {
+                replyStr = responseBody.substring(startQuote + 1, endQuote);
+            }
+        }
     }
 
-    const char *aiText = respDoc["candidates"][0]["content"]["parts"][0]["text"];
-    if (aiText) {
-        String replyStr = String(aiText);
+    if (replyStr.length() > 0) {
         replyStr.trim();
         Serial.printf("[2/3] AI Trả lời: \"%s\"\n", replyStr.c_str());
         return replyStr;
     }
 
+    Serial.println("[2/3] Lỗi Parse câu trả lời từ AI!");
+    Serial.println(responseBody.substring(0, 600));
     return "";
 }
 
@@ -698,7 +687,7 @@ void loop() {
     // 1. Thu âm từ Mic INMP441 trong 3s
     if (!recordAudio3Seconds()) return;
 
-    // 2. Chụp ảnh từ Camera (RGB565 -> JPEG phần mềm)
+    // 2. Chụp ảnh từ Camera (RGB565 -> JPEG)
     if (!captureJpeg()) return;
 
     // 3. Gửi Ảnh + Âm thanh lên Gemini API
