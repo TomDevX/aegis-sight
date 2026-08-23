@@ -8,16 +8,16 @@
 // ============================================================
 
 // Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
-// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> AI pipeline must use RGB565
-//       capture + software JPEG encode (TBD) or a JPEG-capable sensor.
-// #define ENABLE_CAMERA_OV2640
-// #define ENABLE_SPEAKER_I2S
+// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> capture RGB565 + software
+//       JPEG encode (fmt2jpg) before upload.
+#define ENABLE_CAMERA_OV2640
+#define ENABLE_SPEAKER_I2S
 
 // AI Pipeline (Chặng 3 - HTTP REST + Gemini → text → Google TTS)
-// #define ENABLE_AI_PIPELINE
+#define ENABLE_AI_PIPELINE
 
 // Cloud Text-to-Speech (Google Translate TTS) — HTTP MP3 → decode → play
-// #define ENABLE_TTS_CLOUD
+#define ENABLE_TTS_CLOUD
 
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
@@ -38,7 +38,7 @@
 
 // Mic + Camera (image + audio) -> Gemini AI -> Google TTS -> Grove Speaker
 // Chỉ bật 1 test flag tại 1 thời điểm
-#define ENABLE_MIC_AI_CAM_TEST
+// #define ENABLE_MIC_AI_CAM_TEST
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
@@ -48,9 +48,10 @@
 // MAIN PIPELINE (Chặng 2) - Real-time tasks on Core 1
 // Enable these together for the full main build
 // ============================================================
-// #define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
-// #define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
-// #define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
+#define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
+#define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
+#define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
+#define ENABLE_AUTO_VOLUME            // Mic RMS -> auto speaker volume
 
 // ============================================================
 // CAMERA - RHYX M21-45 (GC2145, 2MP) - DVP Bus (Right Module - FPC DVP Bus)
@@ -82,38 +83,48 @@
 // ============================================================
 // MICROPHONE INMP441 - I2S RX (Left Module - Channel 0)
 // L/R pin tied to GND = Left channel
+// SCK -> GPIO41, WS -> GPIO42, SD -> GPIO2
 // ============================================================
 #define MIC_BCLK          41  // SCK
 #define MIC_LRCK          42  // WS (LRCK)
 #define MIC_DATA_IN        2  // SD
 
 // ============================================================
-// SPEAKER - Seeed Grove Speaker (4 chân: VDD, GND, SIG, NC)
-// Loa nhận tín hiệu PWM/analog trên chân SIG (ESP32-S3 không có DAC)
-// Dùng LEDC PWM (channel 2, timer 1) để không xung đột camera
-// (camera đang dùng LEDC_CHANNEL_0 / LEDC_TIMER_0 cho XCLK)
-//
-// LƯU Ý: GPIO40 trên board Freenove N16R8 là SD DATA0 (có pull-up
-// khe thẻ SD) -> loa rè liên tục. Đã chuyển sang GPIO21 (tự do sau
-// khi sửa camera pinout: cũ là CAM_HREF).
+// AMPLIFIER MAX98357A - I2S Class D 3W (trước Loa Grove)
+// DIN -> GPIO19, LRC -> GPIO21, BCLK -> GPIO20
+// Nguồn 5V từ Buck, output nối ra Loa Grove.
+// Chạy trên I2S_SPK_PORT (I2S_NUM_1), tách biệt I2S_MIC_PORT (RX).
 // ============================================================
-#define SPK_PWM_PIN        21  // nối vào chân SIG của Grove Speaker
+#define AMP_I2S_DIN       19  // Data In của MAX98357A
+#define AMP_I2S_LRC       21  // LRCK / WS
+#define AMP_I2S_BCLK      20  // BCLK / SCK
+
+// ============================================================
+// SPEAKER - Seeed Grove Speaker (4 chân: VDD, GND, SIG, NC)
+// Loa giờ được cấp tín hiệu analog qua MAX98357A I2S Amp
+// (xem AMP_I2S_* ở trên) - KHÔNG còn dùng LEDC PWM trực tiếp.
+//
+// LEGACY: SPK_PWM_PIN giữ lại chỉ để các file test cũ compile.
+// Không nối gì vào chân này trong sơ đồ mới.
+// ============================================================
+#define SPK_PWM_PIN        21  // (legacy - không dùng trong sơ đồ mới)
 
 // ============================================================
 // TRIGGER BUTTON (Hỏi AI / Hủy SOS) - Hộp Trái
-// Internal Pull-Up (Active LOW)
+// Internal Pull-Up (Active LOW), Data -> GPIO36, chân còn lại -> GND
 // ============================================================
-#define BTN_TRIGGER       14
+#define BTN_TRIGGER       36
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Hộp Phải, hướng chính diện
+// Nguồn 5V từ Buck
 // ============================================================
 #define ULTRASONIC_TRIG    8
 #define ULTRASONIC_ECHO    9
 
 // ============================================================
-// MPU6050 - I2C (Left Module - Wire     Headband)
-// GPIO48 is the onboard LED — moved SCL to a free pin.
+// MPU6050 - I2C (Left Module)
+// SDA -> GPIO47, SCL -> GPIO39, nguồn 5V từ Buck
 // ============================================================
 #define MPU_SDA           47
 #define MPU_SCL           39
@@ -192,6 +203,11 @@
 #define AI_AUDIO_SAMPLE_RATE    16000
 #define AI_AUDIO_MAX_RECORD_MS  8000
 #define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
+#define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
+
+// JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
+#define AI_JPEG_QUALITY          60
+#define AI_JPEG_BUF_SIZE         (128 * 1024)
 
 // Ring buffer for TTS/response audio playback (PSRAM)
 // Larger buffer (256KB) to accommodate local TTS PCM generation

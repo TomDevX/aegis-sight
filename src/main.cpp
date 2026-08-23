@@ -196,7 +196,9 @@ static void initSerial(void) {
 }
 
 // ============================================================
-// CAMERA OV2640 INIT
+// CAMERA RHYX M21-45 (GC2145) INIT
+// Không có JPEG HW -> capture RGB565 QVGA, nén JPEG bằng
+// fmt2jpg trong ai_pipeline khi bấm nút.
 // ============================================================
 #ifdef ENABLE_CAMERA_OV2640
 static bool initCamera(void) {
@@ -219,21 +221,14 @@ static bool initCamera(void) {
     config.pin_sccb_scl = CAM_SIOC;
     config.pin_pwdn     = CAM_PWDN;
     config.pin_reset    = CAM_RESET;
-    config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG;
 
-    if (psramAvailable) {
-        config.frame_size   = FRAMESIZE_SVGA;
-        config.jpeg_quality = 10;
-        config.fb_count     = 2;
-        config.fb_location  = CAMERA_FB_IN_PSRAM;
-        config.grab_mode    = CAMERA_GRAB_LATEST;
-    } else {
-        config.frame_size   = FRAMESIZE_QVGA;
-        config.jpeg_quality = 15;
-        config.fb_count     = 1;
-        config.fb_location  = CAMERA_FB_IN_DRAM;
-    }
+    // GC2145: PIXFORMAT_JPEG luôn fail 0x106 -> dùng RGB565 QVGA
+    config.xclk_freq_hz = 15000000;
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.frame_size   = FRAMESIZE_QVGA;   // 320x240
+    config.fb_count     = 2;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
@@ -243,8 +238,10 @@ static bool initCamera(void) {
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_brightness(s, 1);
-        s->set_saturation(s, -1);
+        s->set_exposure_ctrl(s, 1);
+        s->set_gain_ctrl(s, 1);
+        s->set_whitebal(s, 1);
+        s->set_aec2(s, 1);
     }
     return true;
 }

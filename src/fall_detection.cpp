@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "config.h"
+#include "fall_detection.h"
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -59,19 +60,22 @@ static float read_sv(void) {
 
 static void play_sos_alarm(void) {
     // SOS pattern: 3 short + 3 long + 3 short (International distress)
+    // Lặp vô hạn cho tới khi người dùng bấm nút để TẮT tiếng cảnh báo
     uint16_t shortMs = 150;
     uint16_t longMs  = 400;
     uint16_t gapMs   = 100;
 
-    for (int cycle = 0; cycle < 3; cycle++) {
-        if (digitalRead(BTN_TRIGGER) == LOW) {
-            Serial.println("[FALL] SOS cancelled by user!");
-            fallState = FALL_IDLE;
-            return;
-        }
+    Serial.println("[FALL] SOS alarm ringing — press button to silence");
 
+    while (true) {
         // 3 short beeps
         for (int i = 0; i < 3; i++) {
+            if (digitalRead(BTN_TRIGGER) == LOW) {
+                Serial.println("[FALL] SOS silenced by user!");
+                tone_driver_stop();   // dừng ngay âm đang kêu + xóa queue
+                fallState = FALL_IDLE;
+                return;
+            }
             tone_driver_play(1000, shortMs, 21);
             vTaskDelay(pdMS_TO_TICKS(shortMs + gapMs));
         }
@@ -79,6 +83,12 @@ static void play_sos_alarm(void) {
 
         // 3 long beeps
         for (int i = 0; i < 3; i++) {
+            if (digitalRead(BTN_TRIGGER) == LOW) {
+                Serial.println("[FALL] SOS silenced by user!");
+                tone_driver_stop();
+                fallState = FALL_IDLE;
+                return;
+            }
             tone_driver_play(1000, longMs, 21);
             vTaskDelay(pdMS_TO_TICKS(longMs + gapMs));
         }
@@ -86,6 +96,12 @@ static void play_sos_alarm(void) {
 
         // 3 short beeps
         for (int i = 0; i < 3; i++) {
+            if (digitalRead(BTN_TRIGGER) == LOW) {
+                Serial.println("[FALL] SOS silenced by user!");
+                tone_driver_stop();
+                fallState = FALL_IDLE;
+                return;
+            }
             tone_driver_play(1000, shortMs, 21);
             vTaskDelay(pdMS_TO_TICKS(shortMs + gapMs));
         }
@@ -163,12 +179,20 @@ static void fall_task(void *pvParameters) {
                 break;
 
             case FALL_CONFIRMED:
+                // Bíp cảnh báo nhẹ 2 lần — bấm nút để tắt ngay
                 tone_driver_play(800, 200, 15);
-                vTaskDelay(pdMS_TO_TICKS(300));
+                for (int i = 0; i < 15 && digitalRead(BTN_TRIGGER) == HIGH; i++)
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                if (digitalRead(BTN_TRIGGER) == LOW) {
+                    Serial.println("[FALL] Warning silenced by user");
+                    tone_driver_stop();
+                    fallState = FALL_IDLE;
+                    break;
+                }
                 tone_driver_play(800, 200, 15);
                 vTaskDelay(pdMS_TO_TICKS(300));
                 fallState = FALL_SOS_COUNTDOWN;
-                stateTimestamp = now;
+                stateTimestamp = millis();
                 Serial.printf("[FALL] Press button within %lu ms to cancel SOS\n",
                               FALL_CANCEL_WAIT_MS);
                 break;
@@ -176,14 +200,15 @@ static void fall_task(void *pvParameters) {
             case FALL_SOS_COUNTDOWN:
                 if (digitalRead(BTN_TRIGGER) == LOW) {
                     Serial.println("[FALL] SOS CANCELLED by user");
+                    tone_driver_stop();
                     fallState = FALL_IDLE;
                     break;
                 }
                 if (now - stateTimestamp >= FALL_CANCEL_WAIT_MS) {
                     Serial.println("[FALL] >>> ACTIVATING SOS ALARM!");
-                    play_sos_alarm();
+                    play_sos_alarm();   // lặp đến khi bấm nút tắt
                     lastSosCycleMs = now;
-                    fallState = FALL_IDLE;
+                    if (fallState != FALL_IDLE) fallState = FALL_IDLE;
                 }
                 break;
         }
@@ -195,4 +220,8 @@ static void fall_task(void *pvParameters) {
 void fall_detection_task_start(void) {
     xTaskCreatePinnedToCore(fall_task, "fall_det", FALL_TASK_STACK,
                             NULL, FALL_TASK_PRIO, NULL, 1);
+}
+
+bool fall_alarm_busy(void) {
+    return fallState != FALL_IDLE;
 }
