@@ -1,5 +1,6 @@
 #include <Preferences.h>
 #include "secrets.h"
+#include "config.h"  // để dùng WIFI_SSID, GEMINI_API_KEY hardcode
 
 static Preferences prefs;
 static bool opened = false;
@@ -12,13 +13,39 @@ void secrets_begin(void) {
 
 bool secrets_has(const char *key) {
     secrets_begin();
-    return opened && prefs.isKey(key);
+    if (!opened) return false;
+    // Coi như có key nếu NVS có HOẶC config.h có giá trị default
+    bool inNvs = prefs.isKey(key);
+    bool inConfig = false;
+    if (strcmp(key, SK_WIFI_SSID) == 0) inConfig = (strlen(WIFI_SSID) > 0);
+    else if (strcmp(key, SK_WIFI_PASS) == 0) inConfig = (strlen(WIFI_PASS) > 0);
+    else if (strcmp(key, SK_GEMINI_KEY) == 0) inConfig = (strlen(GEMINI_API_KEY) > 0);
+    else if (strcmp(key, SK_WIFI_SSID2) == 0) inConfig = (strlen(WIFI_SSID2) > 0);
+    else if (strcmp(key, SK_WIFI_PASS2) == 0) inConfig = (strlen(WIFI_PASS2) > 0);
+    else if (strcmp(key, SK_WIFI_SSID3) == 0) inConfig = (strlen(WIFI_SSID3) > 0);
+    else if (strcmp(key, SK_WIFI_PASS3) == 0) inConfig = (strlen(WIFI_PASS3) > 0);
+    return inNvs || inConfig;
 }
 
 String secrets_get(const char *key, const char *def) {
     secrets_begin();
     if (!opened) return String(def);
-    return prefs.getString(key, def);
+    // Ưu tiên config.h (hardcode) hơn NVS - để code định nghĩa mạng luôn ưu tiên
+    String val = "";
+    if (strcmp(key, SK_WIFI_SSID) == 0) val = String(WIFI_SSID);
+    else if (strcmp(key, SK_WIFI_PASS) == 0) val = String(WIFI_PASS);
+    else if (strcmp(key, SK_GEMINI_KEY) == 0) val = String(GEMINI_API_KEY);
+    else if (strcmp(key, SK_WIFI_SSID2) == 0) val = String(WIFI_SSID2);
+    else if (strcmp(key, SK_WIFI_PASS2) == 0) val = String(WIFI_PASS2);
+    else if (strcmp(key, SK_WIFI_SSID3) == 0) val = String(WIFI_SSID3);
+    else if (strcmp(key, SK_WIFI_PASS3) == 0) val = String(WIFI_PASS3);
+    
+    if (val.length() > 0) return val;
+    
+    // Fallback NVS
+    val = prefs.getString(key, "");
+    if (val.length() > 0) return val;
+    return String(def);
 }
 
 bool secrets_set(const char *key, const String &val) {

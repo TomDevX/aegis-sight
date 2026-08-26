@@ -9,6 +9,7 @@
 #include <Wire.h>
 #endif
 
+#include "mpu_manager.h"
 #include "tone_driver.h"
 #include "tts_driver.h"
 #include "ai_pipeline.h"
@@ -70,10 +71,13 @@ void setup() {
         config_portal_start();
     }
 
-    // --- I2C bus for MPU6050 ---
-    #ifdef ENABLE_MPU6050_FALL_DETECTION
-    Wire.begin(MPU_SDA, MPU_SCL);
-    Serial.println("[INIT] I2C bus started for MPU6050");
+    // --- I2C bus & MPU6050 ---
+    #if defined(ENABLE_MPU6050_FALL_DETECTION) || defined(ENABLE_MOTION_GATE) || defined(ENABLE_ULTRASONIC_HC_SR04)
+    if (mpu_manager_init()) {
+        Serial.println("[INIT] MPU6050 initialized successfully");
+    } else {
+        Serial.println("[WARN] MPU6050 init failed! Check SDA=47, SCL=39");
+    }
     #endif
 
     // --- Camera OV2640 ---
@@ -192,7 +196,25 @@ static void initSerial(void) {
     Serial.println("  AEGIS SIGHT v2.0 - Chặng 3");
     Serial.println("  ESP32-S3-N16R8-CAM | 8MB OPI PSRAM");
     Serial.println("  Gemini Live Stream Pipeline");
-    Serial.println("========================================\n");
+    Serial.println("========================================");
+
+    // Chẩn đoán reset: giúp phân biệt crash (panic/watchdog/brownout)
+    // với reset chủ động (portal timeout, lưu cấu hình xong...)
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char *rrStr = "UNKNOWN";
+    switch (rr) {
+        case ESP_RST_POWERON:   rrStr = "POWERON (bật nguồn bình thường)"; break;
+        case ESP_RST_SW:        rrStr = "SW (reset bằng phần mềm - bình thường)"; break;
+        case ESP_RST_PANIC:     rrStr = "PANIC <<< CRASH! Xem backtrace phía trên"; break;
+        case ESP_RST_INT_WDT:   rrStr = "INT_WDT <<< watchdog ngắt"; break;
+        case ESP_RST_TASK_WDT:  rrStr = "TASK_WDT <<< watchdog task"; break;
+        case ESP_RST_WDT:       rrStr = "WDT <<< watchdog khác"; break;
+        case ESP_RST_BROWNOUT:  rrStr = "BROWNOUT <<< SỤT NGUỒN! Kiểm tra Buck/dây nguồn"; break;
+        case ESP_RST_DEEPSLEEP: rrStr = "DEEPSLEEP"; break;
+        default: break;
+    }
+    Serial.printf("[INIT] Reset reason: %s (%d)\n", rrStr, rr);
+    Serial.println("");
 }
 
 // ============================================================

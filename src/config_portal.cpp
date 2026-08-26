@@ -122,38 +122,76 @@ static void handle_not_found(void) {
 }
 
 void config_portal_start(void) {
+    static bool alreadyStarted = false;
+    if (alreadyStarted) {
+        Serial.println("[PORTAL] Already running — skip duplicate start");
+        return;
+    }
+    alreadyStarted = true;
+
     Serial.println("\n========================================");
     Serial.println("  CONFIG PORTAL — first-time setup");
     Serial.println("========================================");
+    Serial.flush();
 
-    WiFi.mode(WIFI_AP);
-    WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
-                      IPAddress(192, 168, 4, 1),
-                      IPAddress(255, 255, 255, 0));
-    WiFi.softAP(PORTAL_AP_SSID);
+    // Chạy portal trong task riêng có stack lớn (20KB) vì WebServer + DNS
+    // + Wi-Fi AP tốn nhiều stack hơn mặc định 8KB của loopTask -> tránh
+    // stack overflow crash ngay khi bắt đầu SoftAP.
+    TaskHandle_t portalHandle = NULL;
+    xTaskCreate([](void *pv) {
+        // --- Bước 1: SoftAP ---
+        Serial.println("[PORTAL] Step 1: Starting Wi-Fi AP...");
+        Serial.flush();
+        WiFi.mode(WIFI_AP);
+        WiFi.softAPConfig(IPAddress(192, 168, 4, 1),
+                          IPAddress(192, 168, 4, 1),
+                          IPAddress(255, 255, 255, 0));
+        WiFi.softAP(PORTAL_AP_SSID);
 
-    IPAddress apIP = WiFi.softAPIP();
-    Serial.printf("  AP SSID: %s\n", PORTAL_AP_SSID);
-    Serial.printf("  AP IP:   %s\n", apIP.toString().c_str());
+        IPAddress apIP = WiFi.softAPIP();
+        Serial.printf("  AP SSID: %s\n", PORTAL_AP_SSID);
+        Serial.printf("  AP IP:   %s\n", apIP.toString().c_str());
+        Serial.flush();
 
-    dns.start(53, "*", apIP);
+        // --- Bước 2: DNS captive ---
+        Serial.println("[PORTAL] Step 2: Starting DNS...");
+        Serial.flush();
+        dns.start(53, "*", apIP);
 
-    server.on("/", handle_root);
-    server.on("/save", HTTP_POST, handle_save);
-    server.on("/clear", HTTP_POST, handle_clear);
-    server.onNotFound(handle_not_found);
+        // --- Bước 3: Web server ---
+        Serial.println("[PORTAL] Step 3: Starting web server...");
+        Serial.flush();
+        server.on("/", handle_root);
+        server.on("/save", HTTP_POST, handle_save);
+        server.on("/clear", HTTP_POST, handle_clear);
+        server.onNotFound(handle_not_found);
+        server.begin();
 
-    server.begin();
+        Serial.println("[PORTAL] Ready! Connect phone to Wi-Fi \"" PORTAL_AP_SSID "\"");
+        Serial.println("[PORTAL] Portal opens automatically or browse http://192.168.4.1");
+        Serial.flush();
 
-    uint32_t start = millis();
-    while (!saved && (millis() - start) < PORTAL_AP_TIMEOUT_MS) {
-        dns.processNextRequest();
-        server.handleClient();
-        yield();
+        // --- Vòng lặp phục vụ client ---
+        uint32_t start = millis();
+        while (!saved && (millis() - start) < PORTAL_AP_TIMEOUT_MS) {
+            dns.processNextRequest();
+            server.handleClient();
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+
+        if (!saved) {
+            Serial.println("[PORTAL] Timeout — rebooting...");
+            Serial.flush();
+            ESP.restart();
+        }
+        vTaskDelete(NULL);
+    }, "portal", 20480, NULL, 5, &portalHandle);
+
+    // setup() chờ portal hoàn tất (lưu xong hoặc timeout)
+    while (eTaskGetState(portalHandle) != eDeleted && !saved) {
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-    if (!saved) {
-        Serial.println("[PORTAL] Timeout — rebooting...");
-        ESP.restart();
+    if (saved) {
+        vTaskDelay(pdMS_TO_TICKS(200)); // cho task kịp kết thúc sạch
     }
 }

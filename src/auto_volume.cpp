@@ -7,7 +7,7 @@
 
 #define AV_SAMPLE_RATE    16000
 #define AV_READ_SAMPLES   1024
-#define AV_READ_MS        500
+#define AV_READ_MS        150    // chu kỳ ngắn để nhả mic nhanh khi AI cần
 #define AV_TASK_STACK     3072
 #define AV_TASK_PRIO      1
 

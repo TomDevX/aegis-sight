@@ -166,32 +166,46 @@ static bool creds_loaded = false;
 static String cached_last_ssid;
 static String cached_api_key;
 
+// Chỉ đọc key có tồn tại trong NVS để tránh log lỗi NOT_FOUND rác
+static String secrets_get_if(const char *key) {
+    return secrets_has(key) ? secrets_get(key) : String("");
+}
+
 static void wifi_creds_refresh(void) {
-    cached_nets[0].ssid = secrets_get(SK_WIFI_SSID);
-    cached_nets[0].pass = secrets_get(SK_WIFI_PASS);
-    cached_nets[1].ssid = secrets_get(SK_WIFI_SSID2);
-    cached_nets[1].pass = secrets_get(SK_WIFI_PASS2);
-    cached_nets[2].ssid = secrets_get(SK_WIFI_SSID3);
-    cached_nets[2].pass = secrets_get(SK_WIFI_PASS3);
-    cached_last_ssid = secrets_get(SK_LAST_SSID);
-    cached_api_key = secrets_get(SK_GEMINI_KEY);
+    cached_nets[0].ssid = secrets_get_if(SK_WIFI_SSID);
+    cached_nets[0].pass = secrets_get_if(SK_WIFI_PASS);
+    cached_nets[1].ssid = secrets_get_if(SK_WIFI_SSID2);
+    cached_nets[1].pass = secrets_get_if(SK_WIFI_PASS2);
+    cached_nets[2].ssid = secrets_get_if(SK_WIFI_SSID3);
+    cached_nets[2].pass = secrets_get_if(SK_WIFI_PASS3);
+    cached_last_ssid = secrets_get_if(SK_LAST_SSID);
+    cached_api_key = secrets_get_if(SK_GEMINI_KEY);
     creds_loaded = true;
 }
 
 static bool try_ssid(const char *ssid, const char *pass, int tries) {
     if (!ssid || !*ssid) return false;
+    Serial.printf("[WIFI] Đang thử \"%s\"...\n", ssid);
     WiFi.begin(ssid, pass);
     int c = 0;
     while (WiFi.status() != WL_CONNECTED && c < tries) {
         vTaskDelay(pdMS_TO_TICKS(250)); c++;
     }
-    return WiFi.status() == WL_CONNECTED;
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WIFI] OK! IP: %s\n", WiFi.localIP().toString().c_str());
+        return true;
+    }
+    Serial.println("[WIFI] Thất bại");
+    return false;
 }
 
 static bool ensure_wifi(void) {
     if (WiFi.status() == WL_CONNECTED) return true;
     if (!creds_loaded) wifi_creds_refresh();
-    if (cached_nets[0].ssid.length() == 0) return false;
+    if (cached_nets[0].ssid.length() == 0) {
+        Serial.println("[WIFI] KHÔNG CÓ SSID đã lưu! Giữ nút 5s khi boot để vào portal.");
+        return false;
+    }
     WiFi.mode(WIFI_STA);
     bool ok = false;
     if (cached_last_ssid.length()) {
@@ -203,7 +217,7 @@ static bool ensure_wifi(void) {
         if (cached_nets[i].ssid.length() == 0) continue;
         ok = try_ssid(cached_nets[i].ssid.c_str(), cached_nets[i].pass.c_str(), 24);
     }
-    if (!ok) { WiFi.disconnect(true); return false; }
+    if (!ok) { WiFi.disconnect(true); Serial.println("[WIFI] Tất cả mạng đều thất bại!"); return false; }
     cached_last_ssid = WiFi.SSID();
     secrets_set(SK_LAST_SSID, WiFi.SSID());
     return true;
@@ -325,8 +339,18 @@ static bool rec_mic_install(void) {
 // đọc 32-bit, shift >>8 (INMP441 24-bit trong slot 32), lọc DC-offset, gain
 // ============================================================
 static size_t record_until_release(void) {
-    if (!rec_mic_install()) {
-        Serial.println("[AI] Không cài được I2S mic để ghi âm!");
+    // Retry cài I2S tối đa ~1s: đợi auto_volume kịp nhả driver
+    // ("register I2S object to platform failed" = port còn bị chiếm)
+    bool installed = false;
+    for (int attempt = 0; attempt < 20 && !installed; attempt++) {
+        if (rec_mic_install()) {
+            installed = true;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    if (!installed) {
+        Serial.println("[AI] Không cài được I2S mic để ghi âm sau 1s!");
         return 0;
     }
 
@@ -444,7 +468,14 @@ static void ai_audio_task(void *pv) {
         if (btn == LOW && lastBtn == HIGH && (now - debounceMs) > 50) {
             debounceMs = now;
             if (fall_alarm_busy()) {
-                // Nút đang dùng để tắt cảnh báo té ngã — bỏ qua AI
+                // Bấm nút để tắt cảnh báo té ngã SOS
+                fall_alarm_dismiss();
+                lastBtn = btn;
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            if (fall_alarm_was_cancelled_recently()) {
+                // Alarm vừa bị tắt, đang trong cooldown - bỏ qua để tránh trigger AI
                 lastBtn = btn;
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
@@ -463,14 +494,15 @@ static void ai_audio_task(void *pv) {
                 // Đợi auto_volume nhả mic I2S (uninstall driver của nó)
                 vTaskDelay(pdMS_TO_TICKS(100));
 
-                // 1. Ghi âm đến khi thả nút
-                recordSamples = record_until_release();
-
-                // 2. Chụp ảnh ngay khi thả nút
+                // 1. Chụp ảnh NGAY khi vừa bấm nút — ảnh đúng khung hình
+                //    người dùng nhìn thấy tại thời điểm quyết định hỏi
                 if (!capture_jpeg()) {
                     pipelineBusy = false;
                     continue;
                 }
+
+                // 2. Ghi âm đến khi thả nút
+                recordSamples = record_until_release();
 
                 if (recordSamples > 0) {
                     dataReady = true;
@@ -558,7 +590,7 @@ static String send_audio_image_to_gemini(void) {
     String jsonHeader = "{\"contents\":[{\"parts\":["
                         "{\"text\":\"Bạn là trợ lý người mù. Hãy nhìn hình ảnh";
     if (audB64) jsonHeader += " và nghe âm thanh câu hỏi";
-    jsonHeader += ", trả lời ngắn gọn dưới 100 từ bằng tiếng Việt.\"},"
+    jsonHeader += ", trả lời ngắn gọn tối đa 30 từ bằng tiếng Việt.\"},"
                    "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
 
     String jsonMid     = audB64 ? "\"}},{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"" : "";
@@ -683,9 +715,15 @@ static void ai_net_task(void *pv) {
         if (!pipelineBusy || !dataReady) {
             vTaskDelay(pdMS_TO_TICKS(50)); continue;
         }
-        if (!ensure_wifi()) { pipelineBusy = false; dataReady = false; continue; }
+        if (!ensure_wifi()) {
+            Serial.println("[NET] Bỏ lượt hỏi — Wi-Fi không kết nối được");
+            pipelineBusy = false; dataReady = false; continue;
+        }
         if (!creds_loaded) wifi_creds_refresh();
-        if (cached_api_key.length() == 0) { pipelineBusy = false; dataReady = false; continue; }
+        if (cached_api_key.length() == 0) {
+            Serial.println("[NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!");
+            pipelineBusy = false; dataReady = false; continue;
+        }
 
         // --- Gửi ảnh + audio tới Gemini generateContent ---
         String reply = send_audio_image_to_gemini();
@@ -695,13 +733,11 @@ static void ai_net_task(void *pv) {
             ttsSentenceBuf = reply;
             flush_sentences();
             flush_remaining();
+            tts_driver_wait_playback_done();  // Đợi phát trọn vẹn toàn bộ câu trả lời qua loa
+        } else {
+            tone_driver_stream_set_active(false);
         }
 
-        // Đợi phát hết âm thanh còn trong ring buffer rồi mới kết thúc phiên
-        tts_driver_wait_playback_done();
-        tone_driver_stream_set_active(false);
-
-        wifi_sleep();
         pipelineBusy = false; dataReady = false;
     }
 }
@@ -719,7 +755,7 @@ void ai_pipeline_stop(void) {
 }
 bool ai_pipeline_is_busy(void) { return pipelineBusy; }
 void ai_pipeline_net_task_start(void) {
-    xTaskCreatePinnedToCore(ai_net_task, "ai_net", 16384, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(ai_net_task, "ai_net", 32768, NULL, 2, NULL, 0);
 }
 void ai_pipeline_audio_task_start(void) {
     xTaskCreatePinnedToCore(ai_audio_task, "ai_audio", 8192, NULL, 4, NULL, 1);

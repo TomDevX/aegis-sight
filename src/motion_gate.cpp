@@ -3,8 +3,8 @@
 // ============================================================
 // Motion Gate - MPU6050 accelerometer movement detection
 // Computes stddev of SV over a sliding window.
-//   still  -> SV ~= 1g constant  -> tiny stddev
-//   moving -> SV oscillates      -> large stddev
+//   still  -> SV ~= 1g constant  -> tiny stddev (< 0.04g)
+//   moving -> SV oscillates      -> large stddev (> 0.10g)
 // Hysteresis timers prevent flicker at the threshold.
 // ============================================================
 
@@ -13,12 +13,11 @@ static uint32_t windowCount = 0;
 static uint32_t windowIdx   = 0;
 
 static bool          gateEnabled   = false;
-static unsigned long gateSinceMs   = 0;
-static bool          motionRunning = false;
-static unsigned long motionSinceMs = 0;
+static unsigned long movingSinceMs = 0;
+static unsigned long stillSinceMs  = 0;
 
 static bool detect_motion(void) {
-    if (windowCount < 2) {
+    if (windowCount < 5) {
         return false;
     }
 
@@ -49,23 +48,22 @@ void motion_gate_update(float svG) {
     unsigned long now = millis();
 
     if (moving) {
-        if (!motionRunning) {
-            motionRunning = true;
-            motionSinceMs = now;
+        stillSinceMs = 0; // Reset stillness timer
+        if (movingSinceMs == 0) {
+            movingSinceMs = now;
         }
-    } else {
-        motionRunning = false;
-    }
-
-    // Enable after sustained movement, disable after sustained stillness
-    if (motionRunning) {
-        if (!gateEnabled && (now - motionSinceMs >= MOTION_ON_MS)) {
+        // Enable after sustained movement
+        if (!gateEnabled && (now - movingSinceMs >= MOTION_ON_MS)) {
             gateEnabled = true;
-            gateSinceMs = now;
             Serial.println("[MOTION] GATE ON - user is moving");
         }
-    } else if (gateEnabled) {
-        if (now - gateSinceMs >= MOTION_OFF_MS) {
+    } else {
+        movingSinceMs = 0; // Reset motion timer
+        if (stillSinceMs == 0) {
+            stillSinceMs = now;
+        }
+        // Disable only after sustained stillness
+        if (gateEnabled && (now - stillSinceMs >= MOTION_OFF_MS)) {
             gateEnabled = false;
             Serial.println("[MOTION] GATE OFF - user is still");
         }
@@ -80,5 +78,6 @@ void motion_gate_reset(void) {
     windowCount = 0;
     windowIdx   = 0;
     gateEnabled = false;
-    motionRunning = false;
+    movingSinceMs = 0;
+    stillSinceMs  = 0;
 }

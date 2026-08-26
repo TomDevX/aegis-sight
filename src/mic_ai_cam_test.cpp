@@ -18,10 +18,10 @@
 // ============================================================================
 //  USER CONFIGURATION HEADER
 // ============================================================================
-#define USER_WIFI_SSID        "HCMUT.EDU"
-#define USER_WIFI_PASS        "Suong72730109"
+#define USER_WIFI_SSID        ""
+#define USER_WIFI_PASS        ""
 
-#define USER_GEMINI_API_KEY   "API"
+#define USER_GEMINI_API_KEY   ""
 
 #define RECORD_TIME_SEC       3
 #define AUDIO_GAIN            2.0f

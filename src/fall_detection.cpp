@@ -1,227 +1,157 @@
 #include <Arduino.h>
+#include <math.h>
 #include "config.h"
 #include "fall_detection.h"
-#include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include "tone_driver.h"
 #include "ai_pipeline.h"
-#include "motion_gate.h"
+#include "mpu_manager.h"
 
-// ============================================================
-// Fall Detection - MPU6050 3-Phase Algorithm on Core 1
-// Phase 1: Free-fall (SV < 0.5g)
-// Phase 2: Impact (SV > 2.5g within 300ms after free-fall)
-// Phase 3: Inactivity (SV ≈ 1g for 2s after impact)
-// Action: Confirm fall -> SOS alarm after 10s cancel window
-// ============================================================
+#ifdef ENABLE_MPU6050_FALL_DETECTION
 
-#define G_TO_MS2          9.80665f
-#define G_NEUTRAL         1.0f
-#define MPU_READ_MS       20
-#define FALL_TASK_STACK   4096
-#define FALL_TASK_PRIO    4
-
-// Fall state machine
-typedef enum {
+enum FallPhase {
     FALL_IDLE,
-    FALL_FREEFALL,
-    FALL_IMPACT_WAIT,
-    FALL_INACTIVITY_WAIT,
-    FALL_CONFIRMED,
-    FALL_SOS_COUNTDOWN
-} fall_state_t;
+    FALL_FREE_FALL,
+    FALL_IMPACT,
+    FALL_WAITING_STILL
+};
 
-static Adafruit_MPU6050 mpu;
-static fall_state_t fallState = FALL_IDLE;
-static unsigned long stateTimestamp = 0;
-static unsigned long lastSosCycleMs = 0;
+static FallPhase fallPhase = FALL_IDLE;
+static uint32_t phaseTimer = 0;
+static volatile bool alarmActive = false;
+static uint32_t cancelCooldown = 0;
+static uint32_t lastStillPrintMs = 0;
+static uint32_t lastSosAlarmBeepMs = 0;
+static uint8_t freeFallSamples = 0;
+static uint8_t movingSamples = 0;
 
-static bool init_mpu6050(void) {
-    if (!mpu.begin()) {
-        Serial.println("[FALL] MPU6050 not found!");
-        return false;
+static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
+    if (ai_pipeline_is_busy() || (millis() - cancelCooldown < FALL_DEBOUNCE_MS)) {
+        fallPhase = FALL_IDLE;
+        freeFallSamples = 0;
+        movingSamples = 0;
+        return;
     }
-    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-    mpu.setGyroRange(MPU6050_RANGE_2000_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("[FALL] MPU6050 initialized");
-    return true;
-}
 
-static float read_sv(void) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
-    float sv = sqrtf(a.acceleration.x * a.acceleration.x +
-                     a.acceleration.y * a.acceleration.y +
-                     a.acceleration.z * a.acceleration.z);
-    return sv;
-}
+    uint32_t now = millis();
 
-static void play_sos_alarm(void) {
-    // SOS pattern: 3 short + 3 long + 3 short (International distress)
-    // Lặp vô hạn cho tới khi người dùng bấm nút để TẮT tiếng cảnh báo
-    uint16_t shortMs = 150;
-    uint16_t longMs  = 400;
-    uint16_t gapMs   = 100;
-
-    Serial.println("[FALL] SOS alarm ringing — press button to silence");
-
-    while (true) {
-        // 3 short beeps
-        for (int i = 0; i < 3; i++) {
-            if (digitalRead(BTN_TRIGGER) == LOW) {
-                Serial.println("[FALL] SOS silenced by user!");
-                tone_driver_stop();   // dừng ngay âm đang kêu + xóa queue
-                fallState = FALL_IDLE;
-                return;
+    switch (fallPhase) {
+        case FALL_IDLE:
+            // Rơi tự do: Cần 3 mẫu liên tiếp < 0.45G (60ms rơi tự do liên tục)
+            // Tuyệt đối không bị kích hoạt ảo khi để yên trên bàn hoặc nhấc tay nhẹ
+            if (a_total < 0.45f) {
+                freeFallSamples++;
+                if (freeFallSamples >= 3) {
+                    fallPhase = FALL_FREE_FALL;
+                    phaseTimer = now;
+                    freeFallSamples = 0;
+                    movingSamples = 0;
+                    Serial.printf("\n[FALL] >>> Phase 1: Free Fall CONFIRMED (SV=%.2fG) <<<\n", a_total);
+                }
+            } else {
+                freeFallSamples = 0;
             }
-            tone_driver_play(1000, shortMs, 21);
-            vTaskDelay(pdMS_TO_TICKS(shortMs + gapMs));
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
+            break;
 
-        // 3 long beeps
-        for (int i = 0; i < 3; i++) {
-            if (digitalRead(BTN_TRIGGER) == LOW) {
-                Serial.println("[FALL] SOS silenced by user!");
-                tone_driver_stop();
-                fallState = FALL_IDLE;
-                return;
+        case FALL_FREE_FALL:
+            // Pha 2: Chờ va chạm mạnh (> 2.20G) trong cửa sổ 600ms sau cú rơi tự do
+            if (a_total > 2.20f) {
+                fallPhase = FALL_IMPACT;
+                phaseTimer = now;
+                freeFallSamples = 0;
+                movingSamples = 0;
+                Serial.printf("[FALL] >>> Phase 2: Impact CONFIRMED (SV=%.2fG) <<<\n", a_total);
+            } else if (now - phaseTimer > 600) { 
+                fallPhase = FALL_IDLE;
+                freeFallSamples = 0;
             }
-            tone_driver_play(1000, longMs, 21);
-            vTaskDelay(pdMS_TO_TICKS(longMs + gapMs));
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
+            break;
 
-        // 3 short beeps
-        for (int i = 0; i < 3; i++) {
-            if (digitalRead(BTN_TRIGGER) == LOW) {
-                Serial.println("[FALL] SOS silenced by user!");
-                tone_driver_stop();
-                fallState = FALL_IDLE;
-                return;
+        case FALL_IMPACT:
+            // Đợi 400ms để hết rung lắc nảy ban đầu
+            if (now - phaseTimer > 400) {
+                fallPhase = FALL_WAITING_STILL;
+                phaseTimer = now;
+                lastStillPrintMs = now;
+                movingSamples = 0;
+                Serial.println("[FALL] >>> Phase 3: Post-impact stillness check (2.0s)...");
             }
-            tone_driver_play(1000, shortMs, 21);
-            vTaskDelay(pdMS_TO_TICKS(shortMs + gapMs));
+            break;
+
+        case FALL_WAITING_STILL: {
+            float diffFrom1G = fabsf(a_total - 1.0f);
+
+            // Bất động: a_total nằm quanh 1.0G (0.65G đến 1.35G)
+            if (diffFrom1G > 0.45f) {
+                movingSamples++;
+                // Cử động liên tục > 6 mẫu (~120ms) -> Hủy vì người đó vẫn đang cử động bình thường
+                if (movingSamples > 6) {
+                    Serial.printf("[FALL] Motion detected after impact (SV=%.2fG) -> Cancelled\n", a_total);
+                    fallPhase = FALL_IDLE;
+                    movingSamples = 0;
+                }
+            } else {
+                if (movingSamples > 0) movingSamples--;
+
+                if (now - lastStillPrintMs >= 500) {
+                    lastStillPrintMs = now;
+                    Serial.printf("[FALL] Stillness: %.1fs / 2.0s (SV=%.2fG)\n", (float)(now - phaseTimer) / 1000.0f, a_total);
+                }
+
+                if (now - phaseTimer >= FALL_INACTIVITY_MS) {
+                    Serial.println("\n[FALL] ========================================");
+                    Serial.println("[FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<");
+                    Serial.println("[FALL] ========================================\n");
+                    alarmActive = true;
+                    lastSosAlarmBeepMs = 0;
+                    fallPhase = FALL_IDLE;
+                    movingSamples = 0;
+                }
+            }
+            break;
         }
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-static void fall_task(void *pvParameters) {
-    pinMode(BTN_TRIGGER, INPUT_PULLUP);
-
-    if (!init_mpu6050()) {
-        Serial.println("[FALL] Task halting - no MPU6050");
+static void fall_detection_task(void *pv) {
+    if (!mpu_manager_init()) {
+        Serial.println("[FALL] Init MPU6050 failed!");
         vTaskDelete(NULL);
         return;
     }
 
-    Serial.println("[FALL] 3-phase detection task started");
-    motion_gate_reset();
+    Serial.println("[FALL] Fall detection task started (Core 1)");
 
     while (true) {
-        // User is pressing button (AI active) — reset fall detection
-        if (ai_pipeline_is_busy()) {
-            if (fallState != FALL_IDLE) {
-                fallState = FALL_IDLE;
-                Serial.println("[FALL] AI active — reset to IDLE");
+        float ax = 0, ay = 0, az = 0, svG = 1.0f;
+        if (mpu_manager_read_accel_g(&ax, &ay, &az, &svG)) {
+            evaluate_fall_state(ax, ay, az, svG);
+        }
+
+        // Khi báo động SOS đang kích hoạt: Hú còi liên tục tuần hoàn mỗi 800ms cho đến khi bấm nút tắt
+        if (alarmActive) {
+            uint32_t now = millis();
+            if (now - lastSosAlarmBeepMs >= 800) {
+                lastSosAlarmBeepMs = now;
+                tone_driver_play(TONE_ALARM, 500, 21);
             }
-            vTaskDelay(pdMS_TO_TICKS(MPU_READ_MS));
-            continue;
         }
 
-        float sv = read_sv();
-        float svG = sv / G_TO_MS2;
-        motion_gate_update(svG);
-        unsigned long now = millis();
-
-        switch (fallState) {
-            case FALL_IDLE:
-                if (svG < FALL_FREEFALL_G) {
-                    fallState = FALL_FREEFALL;
-                    stateTimestamp = now;
-                    Serial.printf("[FALL] Phase 1: Free-fall detected (SV=%.2fg)\n", svG);
-                }
-                break;
-
-            case FALL_FREEFALL:
-                if (svG > FALL_IMPACT_G) {
-                    fallState = FALL_IMPACT_WAIT;
-                    stateTimestamp = now;
-                    Serial.printf("[FALL] Phase 2: Impact detected (SV=%.2fg)\n", svG);
-                } else if (now - stateTimestamp > FALL_IMPACT_WINDOW) {
-                    fallState = FALL_IDLE;
-                }
-                break;
-
-            case FALL_IMPACT_WAIT:
-                if (svG > 0.9f && svG < 1.1f) {
-                    fallState = FALL_INACTIVITY_WAIT;
-                    stateTimestamp = now;
-                    Serial.printf("[FALL] Phase 3: Inactivity monitoring (SV=%.2fg)\n", svG);
-                } else if (svG > FALL_IMPACT_G) {
-                    stateTimestamp = now;
-                }
-                break;
-
-            case FALL_INACTIVITY_WAIT:
-                if (svG > 0.9f && svG < 1.1f) {
-                    if (now - stateTimestamp >= FALL_INACTIVITY_MS) {
-                        fallState = FALL_CONFIRMED;
-                        Serial.println("[FALL] >>> FALL CONFIRMED! Starting SOS countdown...");
-                    }
-                } else if (svG > FALL_IMPACT_G || svG < FALL_FREEFALL_G) {
-                    fallState = FALL_IDLE;
-                    Serial.println("[FALL] Inactivity interrupted, resetting");
-                }
-                break;
-
-            case FALL_CONFIRMED:
-                // Bíp cảnh báo nhẹ 2 lần — bấm nút để tắt ngay
-                tone_driver_play(800, 200, 15);
-                for (int i = 0; i < 15 && digitalRead(BTN_TRIGGER) == HIGH; i++)
-                    vTaskDelay(pdMS_TO_TICKS(20));
-                if (digitalRead(BTN_TRIGGER) == LOW) {
-                    Serial.println("[FALL] Warning silenced by user");
-                    tone_driver_stop();
-                    fallState = FALL_IDLE;
-                    break;
-                }
-                tone_driver_play(800, 200, 15);
-                vTaskDelay(pdMS_TO_TICKS(300));
-                fallState = FALL_SOS_COUNTDOWN;
-                stateTimestamp = millis();
-                Serial.printf("[FALL] Press button within %lu ms to cancel SOS\n",
-                              FALL_CANCEL_WAIT_MS);
-                break;
-
-            case FALL_SOS_COUNTDOWN:
-                if (digitalRead(BTN_TRIGGER) == LOW) {
-                    Serial.println("[FALL] SOS CANCELLED by user");
-                    tone_driver_stop();
-                    fallState = FALL_IDLE;
-                    break;
-                }
-                if (now - stateTimestamp >= FALL_CANCEL_WAIT_MS) {
-                    Serial.println("[FALL] >>> ACTIVATING SOS ALARM!");
-                    play_sos_alarm();   // lặp đến khi bấm nút tắt
-                    lastSosCycleMs = now;
-                    if (fallState != FALL_IDLE) fallState = FALL_IDLE;
-                }
-                break;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(MPU_READ_MS));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 void fall_detection_task_start(void) {
-    xTaskCreatePinnedToCore(fall_task, "fall_det", FALL_TASK_STACK,
-                            NULL, FALL_TASK_PRIO, NULL, 1);
+    xTaskCreatePinnedToCore(fall_detection_task, "fall_task", 4096, NULL, 3, NULL, 1);
 }
 
-bool fall_alarm_busy(void) {
-    return fallState != FALL_IDLE;
+bool fall_alarm_busy(void) { return alarmActive; }
+bool fall_alarm_was_cancelled_recently(void) { return (millis() - cancelCooldown < 2000); }
+
+void fall_alarm_dismiss(void) {
+    alarmActive = false;
+    cancelCooldown = millis();
+    tone_driver_stop();
+    Serial.println("[FALL] Fall alarm dismissed by user");
 }
+
+#endif

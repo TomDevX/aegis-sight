@@ -5,7 +5,7 @@
 #include "config.h"
 #include "esp_timer.h"
 
-#define TONE_SAMPLE_RATE  16000
+#define TONE_SAMPLE_RATE  24000   // 24kHz — Khớp 100% Native MP3 từ Google TTS (không cần resample)
 #define TONE_BITS         16
 #define TONE_BUF_SAMPLES  512
 

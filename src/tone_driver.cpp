@@ -3,43 +3,48 @@
 #include <string.h>
 #include "driver/i2s.h"
 
-#define TONE_QUEUE_SIZE    8
-#define TONE_TASK_STACK    4096
-#define TONE_TASK_PRIO     3
+#define TONE_QUEUE_SIZE    16
+#define TONE_TASK_STACK    8192
+#define TONE_TASK_PRIO     4
 
-// --- I2S output: MAX98357A Class-D Amp -> Grove Speaker ---
-// ESP32-S3 Master TX trên I2S_SPK_PORT (I2S_NUM_1), tách biệt
-// mic RX trên I2S_MIC_PORT (I2S_NUM_0).
-#define SPK_DMA_BUF_COUNT  8
-#define SPK_DMA_BUF_LEN    256
+// DMA Buffers lớn (12 buffers x 1024 samples) để tránh ngắt quãng khi HTTP tải chậm
+#define SPK_DMA_BUF_COUNT  12
+#define SPK_DMA_BUF_LEN    1024
+
+// Ngưỡng Pre-buffering: đệm ít nhất ~350ms âm thanh mới bắt đầu đẩy ra loa
+#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 35 / 100)
 
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;
 static volatile bool toneStopFlag = false;
-static volatile uint8_t currentVolume = 12;
+static volatile uint8_t currentVolume = 18; // Mức âm lượng chuẩn rõ, không méo
 
 static QueueHandle_t toneQueue = NULL;
+static uint32_t currentSampleRate = TONE_SAMPLE_RATE;
 
-// --- AI audio stream ring buffer ---
+// --- PSRAM Ring Buffer ---
 static int16_t *streamBuf = NULL;
 static volatile size_t streamWriteIdx = 0;
 static volatile size_t streamReadIdx  = 0;
 static size_t streamCapacity = 0;
 static volatile bool streamActive = false;
+static volatile bool streamBuffering = true;
 
 static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
 
 static bool spk_install_i2s(void) {
     i2s_config_t i2s_cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = TONE_SAMPLE_RATE,
+        .sample_rate = currentSampleRate,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = SPK_DMA_BUF_COUNT,
         .dma_buf_len = SPK_DMA_BUF_LEN,
-        .use_apll = false,
+        .use_apll = false, // Dùng PLL nội chuẩn, tránh lỗi divider gây lệch clock trên S3
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
     };
 
     i2s_pin_config_t pin_cfg = {
@@ -58,26 +63,56 @@ static bool spk_install_i2s(void) {
     return true;
 }
 
-// Ghi PCM mono ra I2S stereo (nhân đôi kênh cho MAX98357A),
-// áp volume scaling, ghi block để DMA kịp trống.
+// Cập nhật sample rate nếu MP3 giải mã ra tần số khác (ví dụ: 24kHz từ Google TTS)
+void tone_driver_set_sample_rate(uint32_t rate) {
+    if (rate != currentSampleRate && rate >= 8000 && rate <= 48000) {
+        currentSampleRate = rate;
+        i2s_set_sample_rates(I2S_SPK_PORT, currentSampleRate);
+        Serial.printf("[TONE] Switched I2S Sample Rate to %u Hz\n", rate);
+    }
+}
+
+// Ghi dữ liệu PCM ra 2 kênh stereo cho MAX98357A (Mono -> Stereo duplicated)
 static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
-    static int16_t frame[256][2];
-    float volScale = currentVolume / 21.0f;
+    static int16_t frame[512][2];
+    
+    // MAX98357A là amply Class D 3W rất mạnh. Với củ loa mini Seeed Grove (0.5W/8Ω),
+    // tín hiệu Full-Scale (1.0) sẽ làm màng loa bị đập đáy (bottom-out) gây méo tiếng và rè xè.
+    // Dải scale 0.12f .. 0.38f tạo công suất ~0.1W .. 0.4W hoàn hảo: tiếng nói trong trẻo, to rõ, êm dịu, không bao giờ bị rè.
+    float volScale = 0.0f;
+    if (currentVolume > 0) {
+        volScale = 0.12f + (float)(currentVolume - 1) * (0.26f / 20.0f);
+    }
 
     uint32_t pos = 0;
     while (pos < samples) {
         if (checkStop && checkStop()) break;
         uint32_t chunk = samples - pos;
-        if (chunk > 256) chunk = 256;
+        if (chunk > 512) chunk = 512;
+
         for (uint32_t i = 0; i < chunk; i++) {
             int32_t s = (int32_t)(buf[pos + i] * volScale);
-            if (s > 32767) s = 32767;
-            else if (s < -32768) s = -32768;
+            // Soft clipping
+            if (s > 32000) s = 32000;
+            else if (s < -32000) s = -32000;
             frame[i][0] = (int16_t)s;
             frame[i][1] = (int16_t)s;
         }
-        size_t written = 0;
-        i2s_write(I2S_SPK_PORT, frame, chunk * sizeof(frame[0]), &written, portMAX_DELAY);
+
+        uint8_t *pBytes = (uint8_t *)frame;
+        size_t bytesLeft = chunk * sizeof(frame[0]);
+
+        while (bytesLeft > 0) {
+            if (checkStop && checkStop()) break;
+            size_t written = 0;
+            esp_err_t err = i2s_write(I2S_SPK_PORT, pBytes, bytesLeft, &written, pdMS_TO_TICKS(100));
+            if (err == ESP_OK && written > 0) {
+                pBytes += written;
+                bytesLeft -= written;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
         pos += chunk;
     }
 }
@@ -100,22 +135,30 @@ bool tone_driver_init(void) {
         return false;
     }
 
-    Serial.printf("[TONE] I2S speaker ready (MAX98357A DIN=%d LRC=%d BCLK=%d @ %dHz)\n",
-                  AMP_I2S_DIN, AMP_I2S_LRC, AMP_I2S_BCLK, TONE_SAMPLE_RATE);
+    Serial.printf("[TONE] I2S Speaker Ready (MAX98357A DIN=%d LRC=%d BCLK=%d @ %dHz)\n",
+                  AMP_I2S_DIN, AMP_I2S_LRC, AMP_I2S_BCLK, currentSampleRate);
     return true;
 }
 
-// Phát sóng vuông freqHz trong durationMs qua I2S (software synthesized)
 static void play_tone_request(const tone_request_t &req) {
-    const uint32_t halfPeriodSamples = (TONE_SAMPLE_RATE / req.freqHz) / 2;
-    if (halfPeriodSamples == 0) return;
+    if (req.freqHz == 0 || req.durationMs == 0) return;
 
-    // Amplitude theo volume: 5..100% full scale (SOS cần tối đa)
-    const int32_t amp = (int32_t)(32767.0f * (0.05f + 0.95f * req.volume / 21.0f));
+    // Reset về sample rate chuẩn khi phát còi/bíp
+    tone_driver_set_sample_rate(TONE_SAMPLE_RATE);
+
+    float volScale = (req.volume == 0) ? 0.0f : powf((float)req.volume / 21.0f, 1.5f);
+    const int32_t amp = (int32_t)(32000.0f * volScale);
 
     uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * req.durationMs) / 1000;
-    uint32_t phase = 0;
+    if (totalSamples == 0) return;
+
+    float phaseInc = (2.0f * (float)M_PI * (float)req.freqHz) / (float)TONE_SAMPLE_RATE;
+    float phase = 0.0f;
     uint32_t generated = 0;
+
+    uint32_t fadeSamples = (TONE_SAMPLE_RATE * 5) / 1000; // 5ms fade chống lụp bụp
+    if (fadeSamples > totalSamples / 4) fadeSamples = totalSamples / 4;
+    if (fadeSamples == 0) fadeSamples = 1;
 
     while (generated < totalSamples) {
         if (toneStopFlag || streamActive) break;
@@ -124,22 +167,22 @@ static void play_tone_request(const tone_request_t &req) {
         if (n > TONE_BUF_SAMPLES) n = TONE_BUF_SAMPLES;
 
         for (uint32_t i = 0; i < n; i++) {
-            toneBuf[i] = (phase < halfPeriodSamples) ? (int16_t)amp : (int16_t)-amp;
-            if (++phase >= halfPeriodSamples * 2) phase = 0;
+            uint32_t sampleIdx = generated + i;
+            float env = 1.0f;
+            if (sampleIdx < fadeSamples) {
+                env = (float)sampleIdx / (float)fadeSamples;
+            } else if (sampleIdx > totalSamples - fadeSamples) {
+                env = (float)(totalSamples - sampleIdx) / (float)fadeSamples;
+            }
+
+            toneBuf[i] = (int16_t)(sinf(phase) * env * (float)amp);
+            phase += phaseInc;
+            if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
         }
 
-        // Bíp dùng volume của chính request (SOS cần max 21, bíp US theo auto-volume)
-        uint8_t savedVolume = currentVolume;
-        currentVolume = req.volume;
         i2s_output(toneBuf, n, NULL);
-        currentVolume = savedVolume;
-
         generated += n;
     }
-
-    // Im lặng cuối bíp để ngắt âm sạch
-    memset(toneBuf, 0, TONE_BUF_SAMPLES * sizeof(int16_t));
-    i2s_output(toneBuf, TONE_BUF_SAMPLES / 4, NULL);
 }
 
 static void tone_task(void *pvParameters) {
@@ -147,24 +190,36 @@ static void tone_task(void *pvParameters) {
 
     while (true) {
         if (streamActive) {
-            size_t avail = (streamWriteIdx - streamReadIdx + streamCapacity) % streamCapacity;
-            if (avail >= TONE_BUF_SAMPLES) {
-                for (size_t i = 0; i < TONE_BUF_SAMPLES; i++) {
-                    toneBuf[i] = streamBuf[streamReadIdx];
-                    streamReadIdx = (streamReadIdx + 1) % streamCapacity;
+            size_t r = streamReadIdx;
+            size_t w = streamWriteIdx;
+            size_t avail = (w - r + streamCapacity) % streamCapacity;
+
+            // Pre-buffering: chờ đệm đủ âm thanh trước khi phát
+            if (streamBuffering) {
+                if (avail >= STREAM_PREBUFFER_SAMPLES) {
+                    streamBuffering = false;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
                 }
-                i2s_output(toneBuf, TONE_BUF_SAMPLES, stop_check_stream);
+            }
+
+            if (avail > 0) {
+                size_t chunk = (avail > 512) ? 512 : avail;
+                for (size_t i = 0; i < chunk; i++) {
+                    toneBuf[i] = streamBuf[(r + i) % streamCapacity];
+                }
+                streamReadIdx = (r + chunk) % streamCapacity;
+                i2s_output(toneBuf, chunk, stop_check_stream);
+                continue;
+            } else {
+                streamBuffering = true;
+                vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
-            if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
-                goto play_tone;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
         }
 
-        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
-play_tone:
+        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(50)) == pdTRUE) {
             tonePlaying = true;
             toneStopFlag = false;
             play_tone_request(req);
@@ -189,18 +244,9 @@ void tone_driver_stop(void) {
     xQueueReset(toneQueue);
 }
 
-bool tone_driver_is_playing(void) {
-    return tonePlaying;
-}
-
-void tone_driver_set_volume(uint8_t vol) {
-    if (vol > 21) vol = 21;
-    currentVolume = vol;
-}
-
-uint8_t tone_driver_get_volume(void) {
-    return currentVolume;
-}
+bool tone_driver_is_playing(void) { return tonePlaying; }
+void tone_driver_set_volume(uint8_t vol) { currentVolume = (vol > 21) ? 21 : vol; }
+uint8_t tone_driver_get_volume(void) { return currentVolume; }
 
 void tone_driver_stream_init(void) {
     if (streamBuf) return;
@@ -213,27 +259,27 @@ void tone_driver_stream_init(void) {
     streamWriteIdx = 0;
     streamReadIdx  = 0;
     streamActive   = false;
-    Serial.printf("[TONE] Stream ring buffer: %zu samples (%zu KB on PSRAM)\n",
-                  streamCapacity, AI_PCM_RINGBUF_SIZE / 1024);
+    streamBuffering = true;
 }
 
 bool tone_driver_stream_write(const int16_t *data, size_t samples) {
     if (!streamBuf || !streamActive) return false;
 
-    size_t space = (streamReadIdx - streamWriteIdx + streamCapacity - 1) % streamCapacity;
-    if (samples > space) {
-        return false;
-    }
+    size_t r = streamReadIdx;
+    size_t w = streamWriteIdx;
+    size_t space = (r - w + streamCapacity - 1) % streamCapacity;
+    if (samples > space) return false;
 
     for (size_t i = 0; i < samples; i++) {
-        streamBuf[streamWriteIdx] = data[i];
-        streamWriteIdx = (streamWriteIdx + 1) % streamCapacity;
+        streamBuf[(w + i) % streamCapacity] = data[i];
     }
+    streamWriteIdx = (w + samples) % streamCapacity;
     return true;
 }
 
 void tone_driver_stream_set_active(bool active) {
     streamActive = active;
+    streamBuffering = true;
     if (!active) {
         streamWriteIdx = 0;
         streamReadIdx  = 0;
@@ -241,11 +287,10 @@ void tone_driver_stream_set_active(bool active) {
     }
 }
 
-bool tone_driver_stream_is_active(void) {
-    return streamActive;
-}
-
+bool tone_driver_stream_is_active(void) { return streamActive; }
 size_t tone_driver_stream_available(void) {
     if (!streamActive) return 0;
-    return (streamWriteIdx - streamReadIdx + streamCapacity) % streamCapacity;
+    size_t r = streamReadIdx;
+    size_t w = streamWriteIdx;
+    return (w - r + streamCapacity) % streamCapacity;
 }
