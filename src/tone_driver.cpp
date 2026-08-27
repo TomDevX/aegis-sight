@@ -1,83 +1,126 @@
 #include "tone_driver.h"
 #include <math.h>
 #include <string.h>
-#include "driver/ledc.h"
+#include "driver/i2s.h"
 
-#define TONE_QUEUE_SIZE    8
-#define TONE_TASK_STACK    4096
-#define TONE_TASK_PRIO     3
+#define TONE_QUEUE_SIZE    16
+#define TONE_TASK_STACK    8192
+#define TONE_TASK_PRIO     4
 
-// --- PWM output: Seeed Grove Speaker (SIG = PWM, ESP32-S3 has no DAC) ---
-#define PWM_CHANNEL        2    // camera uses LEDC_CHANNEL_0 / LEDC_TIMER_0
-#define PWM_RES_BITS       10
-#define PWM_RES_MAX        ((1 << PWM_RES_BITS) - 1)  // 1023
-#define PWM_CARRIER_HZ     78125                       // 80MHz / 2^10
-#define PWM_DC_MID         (PWM_RES_MAX / 2)           // ~silence
+// DMA Buffers lớn (12 buffers x 1024 samples) để tránh ngắt quãng khi HTTP tải chậm
+#define SPK_DMA_BUF_COUNT  12
+#define SPK_DMA_BUF_LEN    1024
 
-// 1000000 / TONE_SAMPLE_RATE = 62.5us -> alternate 62/63 per sample
-#define SAMPLE_PERIOD_US_LO   62
-#define SAMPLE_PERIOD_US_HI   63
+// Ngưỡng Pre-buffering: đệm ít nhất ~350ms âm thanh mới bắt đầu đẩy ra loa
+#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 35 / 100)
 
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;
 static volatile bool toneStopFlag = false;
-static volatile uint8_t currentVolume = 12;
+static volatile uint8_t currentVolume = 18; // Mức âm lượng chuẩn rõ, không méo
 
 static QueueHandle_t toneQueue = NULL;
+static uint32_t currentSampleRate = TONE_SAMPLE_RATE;
 
-// --- AI audio stream ring buffer ---
+// --- PSRAM Ring Buffer ---
 static int16_t *streamBuf = NULL;
 static volatile size_t streamWriteIdx = 0;
 static volatile size_t streamReadIdx  = 0;
 static size_t streamCapacity = 0;
 static volatile bool streamActive = false;
+static volatile bool streamBuffering = true;
+static uint32_t lastStreamDataMs = 0;
 
 static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
 
-static uint32_t ledcFreqHz = 0;
+static bool spk_install_i2s(void) {
+    i2s_config_t i2s_cfg = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = currentSampleRate,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = SPK_DMA_BUF_COUNT,
+        .dma_buf_len = SPK_DMA_BUF_LEN,
+        .use_apll = false, // Dùng PLL nội chuẩn, tránh lỗi divider gây lệch clock trên S3
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
 
-// Ép clock APB 80MHz. Nếu để AUTO, driver có thể chọn XTAL 40MHz -> 10-bit
-// @ 78.125kHz vượt giới hạn -> ledcSetup fail -> loa phát rác rè rè.
-static bool ledc_set_freq(uint32_t f) {
-    ledc_timer_config_t timer = {};
-    timer.speed_mode = LEDC_LOW_SPEED_MODE;
-    timer.timer_num = (ledc_timer_t)LEDC_TIMER_1;
-    timer.duty_resolution = (ledc_timer_bit_t)PWM_RES_BITS;
-    timer.freq_hz = f;
-    timer.clk_cfg = LEDC_USE_APB_CLK;
-    return ledc_timer_config(&timer) == ESP_OK;
+    i2s_pin_config_t pin_cfg = {
+        .bck_io_num = AMP_I2S_BCLK,
+        .ws_io_num = AMP_I2S_LRC,
+        .data_out_num = AMP_I2S_DIN,
+        .data_in_num = I2S_PIN_NO_CHANGE,
+    };
+
+    if (i2s_driver_install(I2S_SPK_PORT, &i2s_cfg, 0, NULL) != ESP_OK) return false;
+    if (i2s_set_pin(I2S_SPK_PORT, &pin_cfg) != ESP_OK) {
+        i2s_driver_uninstall(I2S_SPK_PORT);
+        return false;
+    }
+    i2s_zero_dma_buffer(I2S_SPK_PORT);
+    return true;
 }
 
-static void set_ledc_freq(uint32_t f) {
-    if (ledcFreqHz != f) {
-        ledc_set_freq(f);
-        ledcFreqHz = f;
+// Cập nhật sample rate nếu MP3 giải mã ra tần số khác (ví dụ: 24kHz từ Google TTS)
+void tone_driver_set_sample_rate(uint32_t rate) {
+    if (rate != currentSampleRate && rate >= 8000 && rate <= 48000) {
+        currentSampleRate = rate;
+        i2s_set_sample_rates(I2S_SPK_PORT, currentSampleRate);
+        Serial.printf("[TONE] Switched I2S Sample Rate to %u Hz\n", rate);
     }
 }
 
-// Play int16 PCM through PWM, paced at TONE_SAMPLE_RATE.
-// checkStop (optional): abort early when true.
-static void pwm_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
-    set_ledc_freq(PWM_CARRIER_HZ);
-    int64_t next = esp_timer_get_time();
-    for (uint32_t i = 0; i < samples; i++) {
+// Ghi dữ liệu PCM ra 2 kênh stereo cho MAX98357A (Mono -> Stereo duplicated)
+static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
+    static int16_t frame[512][2];
+    
+    // Thang âm lượng 1..21: dải scale 0.40f .. 1.05f cho giọng nói AI cực to rõ và đầy đặn
+    float volScale = 0.0f;
+    if (currentVolume > 0) {
+        volScale = 0.40f + (float)(currentVolume - 1) * (0.65f / 20.0f);
+    }
+
+    uint32_t pos = 0;
+    while (pos < samples) {
         if (checkStop && checkStop()) break;
-        int32_t d = PWM_DC_MID + ((int32_t)buf[i] >> (16 - PWM_RES_BITS));
-        if (d < 0) d = 0;
-        else if (d > PWM_RES_MAX) d = PWM_RES_MAX;
-        ledcWrite(PWM_CHANNEL, (uint32_t)d);
-        next += (i & 1) ? SAMPLE_PERIOD_US_HI : SAMPLE_PERIOD_US_LO;
-        while (esp_timer_get_time() < next) {}
+        uint32_t chunk = samples - pos;
+        if (chunk > 512) chunk = 512;
+
+        for (uint32_t i = 0; i < chunk; i++) {
+            int32_t s = (int32_t)(buf[pos + i] * volScale);
+            // Soft clipping
+            if (s > 32000) s = 32000;
+            else if (s < -32000) s = -32000;
+            frame[i][0] = (int16_t)s;
+            frame[i][1] = (int16_t)s;
+        }
+
+        uint8_t *pBytes = (uint8_t *)frame;
+        size_t bytesLeft = chunk * sizeof(frame[0]);
+
+        while (bytesLeft > 0) {
+            if (checkStop && checkStop()) break;
+            size_t written = 0;
+            esp_err_t err = i2s_write(I2S_SPK_PORT, pBytes, bytesLeft, &written, pdMS_TO_TICKS(100));
+            if (err == ESP_OK && written > 0) {
+                pBytes += written;
+                bytesLeft -= written;
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+        pos += chunk;
     }
 }
 
 bool tone_driver_init(void) {
-    if (!ledc_set_freq(PWM_CARRIER_HZ)) {
-        Serial.printf("[TONE] PWM timer config failed (%dHz) -> speaker may be noisy\n", PWM_CARRIER_HZ);
+    if (!spk_install_i2s()) {
+        Serial.println("[TONE] I2S init failed for MAX98357A!");
+        return false;
     }
-    ledcAttachPin(SPK_PWM_PIN, PWM_CHANNEL);
-    ledcWrite(PWM_CHANNEL, 0);   // duty 0 = im lặng (50% sẽ rè rè liên tục trên Grove amp)
-    ledcFreqHz = PWM_CARRIER_HZ;
 
     toneBuf = (int16_t *)ps_malloc(TONE_BUF_SAMPLES * sizeof(int16_t));
     if (!toneBuf) {
@@ -91,9 +134,67 @@ bool tone_driver_init(void) {
         return false;
     }
 
-    Serial.printf("[TONE] PWM speaker ready (pin=%d, ch=%d, %d-bit @ %dHz)\n",
-                  SPK_PWM_PIN, PWM_CHANNEL, PWM_RES_BITS, PWM_CARRIER_HZ);
+    Serial.printf("[TONE] I2S Speaker Ready (MAX98357A DIN=%d LRC=%d BCLK=%d @ %dHz)\n",
+                  AMP_I2S_DIN, AMP_I2S_LRC, AMP_I2S_BCLK, currentSampleRate);
     return true;
+}
+
+static void play_tone_request(const tone_request_t &req) {
+    if (req.freqHz == 0 || req.durationMs == 0) return;
+
+    // Reset về sample rate chuẩn khi phát còi/bíp
+    tone_driver_set_sample_rate(TONE_SAMPLE_RATE);
+
+    float volScale = (req.volume == 0) ? 0.0f : (0.30f + (float)req.volume * (0.70f / 21.0f));
+    const int32_t amp = (int32_t)(32000.0f * volScale);
+
+    uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * req.durationMs) / 1000;
+    if (totalSamples == 0) return;
+
+    float phaseInc = (2.0f * (float)M_PI * (float)req.freqHz) / (float)TONE_SAMPLE_RATE;
+    float phase = 0.0f;
+    uint32_t generated = 0;
+
+    // Smooth Raised-Cosine Fade (12ms)
+    uint32_t fadeSamples = (TONE_SAMPLE_RATE * 12) / 1000;
+    if (fadeSamples > totalSamples / 3) fadeSamples = totalSamples / 3;
+    if (fadeSamples == 0) fadeSamples = 1;
+
+    while (generated < totalSamples) {
+        if (toneStopFlag || streamActive) break;
+
+        uint32_t n = totalSamples - generated;
+        if (n > TONE_BUF_SAMPLES) n = TONE_BUF_SAMPLES;
+
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t sampleIdx = generated + i;
+            float env = 1.0f;
+            if (sampleIdx < fadeSamples) {
+                float f = (float)sampleIdx / (float)fadeSamples;
+                env = 0.5f * (1.0f - cosf(f * (float)M_PI));
+            } else if (sampleIdx > totalSamples - fadeSamples) {
+                float f = (float)(totalSamples - sampleIdx) / (float)fadeSamples;
+                env = 0.5f * (1.0f - cosf(f * (float)M_PI));
+            }
+
+            // Sóng còi ấm áp chuẩn nguyên bản
+            float wave = 0.88f * sinf(phase) + 0.12f * sinf(phase * 2.0f);
+            toneBuf[i] = (int16_t)(wave * env * (float)amp);
+
+            phase += phaseInc;
+            if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+        }
+
+        // Ghi trực tiếp ra I2S
+        static int16_t frame[512][2];
+        for (uint32_t i = 0; i < n; i++) {
+            frame[i][0] = toneBuf[i];
+            frame[i][1] = toneBuf[i];
+        }
+        size_t written = 0;
+        i2s_write(I2S_SPK_PORT, frame, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+        generated += n;
+    }
 }
 
 static void tone_task(void *pvParameters) {
@@ -101,42 +202,45 @@ static void tone_task(void *pvParameters) {
 
     while (true) {
         if (streamActive) {
-            size_t avail = (streamWriteIdx - streamReadIdx + streamCapacity) % streamCapacity;
-            if (avail >= TONE_BUF_SAMPLES) {
-                size_t toRead = TONE_BUF_SAMPLES;
-                float volScale = currentVolume / 21.0f;
-                for (size_t i = 0; i < toRead; i++) {
-                    toneBuf[i] = (int16_t)(streamBuf[streamReadIdx] * volScale);
-                    streamReadIdx = (streamReadIdx + 1) % streamCapacity;
+            size_t r = streamReadIdx;
+            size_t w = streamWriteIdx;
+            size_t avail = (w - r + streamCapacity) % streamCapacity;
+
+            // Pre-buffering: chờ đệm đủ âm thanh trước khi phát
+            if (streamBuffering) {
+                if (avail >= STREAM_PREBUFFER_SAMPLES) {
+                    streamBuffering = false;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
                 }
-                pwm_output(toneBuf, toRead, stop_check_stream);
+            }
+
+            if (avail > 0) {
+                lastStreamDataMs = millis();
+                size_t chunk = (avail > 512) ? 512 : avail;
+                for (size_t i = 0; i < chunk; i++) {
+                    toneBuf[i] = streamBuf[(r + i) % streamCapacity];
+                }
+                streamReadIdx = (r + chunk) % streamCapacity;
+                i2s_output(toneBuf, chunk, stop_check_stream);
+                continue;
+            } else {
+                streamBuffering = true;
+                // Nếu buffer rỗng liên tục quá 300ms -> Tự động giải phóng streamActive để nhả loa cho siêu âm và té ngã
+                if (millis() - lastStreamDataMs > 300) {
+                    streamActive = false;
+                    continue;
+                }
+                vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
-            if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(5)) == pdTRUE) {
-                goto play_tone;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
         }
 
-        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
-play_tone:
+        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(50)) == pdTRUE) {
             tonePlaying = true;
             toneStopFlag = false;
-
-            // Sóng vuông tần số = req.freqHz: sạch & to trên Grove Speaker
-            set_ledc_freq(req.freqHz);
-            uint32_t pct = 5 + (45u * req.volume) / 21u;   // 5..50% duty
-            ledcWrite(PWM_CHANNEL, (uint32_t)1023u * pct / 100u);
-
-            uint32_t t0 = millis();
-            while (millis() - t0 < req.durationMs) {
-                if (toneStopFlag || streamActive) break;
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-
-            set_ledc_freq(PWM_CARRIER_HZ);
-            ledcWrite(PWM_CHANNEL, 0);   // tắt hẳn sau bíp, tránh rè rè
+            play_tone_request(req);
             tonePlaying = false;
         }
     }
@@ -158,18 +262,9 @@ void tone_driver_stop(void) {
     xQueueReset(toneQueue);
 }
 
-bool tone_driver_is_playing(void) {
-    return tonePlaying;
-}
-
-void tone_driver_set_volume(uint8_t vol) {
-    if (vol > 21) vol = 21;
-    currentVolume = vol;
-}
-
-uint8_t tone_driver_get_volume(void) {
-    return currentVolume;
-}
+bool tone_driver_is_playing(void) { return tonePlaying; }
+void tone_driver_set_volume(uint8_t vol) { currentVolume = (vol > 21) ? 21 : vol; }
+uint8_t tone_driver_get_volume(void) { return currentVolume; }
 
 void tone_driver_stream_init(void) {
     if (streamBuf) return;
@@ -182,38 +277,38 @@ void tone_driver_stream_init(void) {
     streamWriteIdx = 0;
     streamReadIdx  = 0;
     streamActive   = false;
-    Serial.printf("[TONE] Stream ring buffer: %zu samples (%zu KB on PSRAM)\n",
-                  streamCapacity, AI_PCM_RINGBUF_SIZE / 1024);
+    streamBuffering = true;
 }
 
 bool tone_driver_stream_write(const int16_t *data, size_t samples) {
     if (!streamBuf || !streamActive) return false;
 
-    size_t space = (streamReadIdx - streamWriteIdx + streamCapacity - 1) % streamCapacity;
-    if (samples > space) {
-        return false;
-    }
+    size_t r = streamReadIdx;
+    size_t w = streamWriteIdx;
+    size_t space = (r - w + streamCapacity - 1) % streamCapacity;
+    if (samples > space) return false;
 
     for (size_t i = 0; i < samples; i++) {
-        streamBuf[streamWriteIdx] = data[i];
-        streamWriteIdx = (streamWriteIdx + 1) % streamCapacity;
+        streamBuf[(w + i) % streamCapacity] = data[i];
     }
+    streamWriteIdx = (w + samples) % streamCapacity;
     return true;
 }
 
 void tone_driver_stream_set_active(bool active) {
     streamActive = active;
+    streamBuffering = true;
     if (!active) {
         streamWriteIdx = 0;
         streamReadIdx  = 0;
+        i2s_zero_dma_buffer(I2S_SPK_PORT);
     }
 }
 
-bool tone_driver_stream_is_active(void) {
-    return streamActive;
-}
-
+bool tone_driver_stream_is_active(void) { return streamActive; }
 size_t tone_driver_stream_available(void) {
     if (!streamActive) return 0;
-    return (streamWriteIdx - streamReadIdx + streamCapacity) % streamCapacity;
+    size_t r = streamReadIdx;
+    size_t w = streamWriteIdx;
+    return (w - r + streamCapacity) % streamCapacity;
 }

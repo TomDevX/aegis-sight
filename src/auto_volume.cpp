@@ -7,22 +7,24 @@
 
 #define AV_SAMPLE_RATE    16000
 #define AV_READ_SAMPLES   1024
-#define AV_READ_MS        500
+#define AV_READ_MS        150    // chu kỳ ngắn để nhả mic nhanh khi AI cần
 #define AV_TASK_STACK     3072
 #define AV_TASK_PRIO      1
 
 static int16_t *micBuf = NULL;
 
 static bool init_mic_i2s(void) {
+    // INMP441 xuất 24-bit trong slot 32-bit -> PHẢI đọc 32-bit
+    // (giống initMicI2S trong mic_ai_cam_test)
     i2s_config_t i2s_cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = AV_SAMPLE_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = 512,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
         .use_apll = false,
     };
 
@@ -62,44 +64,41 @@ static uint8_t rms_to_volume(float rms) {
 
 static void auto_volume_task(void *pvParameters) {
     micBuf = (int16_t *)ps_malloc(AV_READ_SAMPLES * sizeof(int16_t));
-    if (!micBuf) {
+    int32_t *rawBuf = (int32_t *)ps_malloc(AV_READ_SAMPLES * sizeof(int32_t));
+    if (!micBuf || !rawBuf) {
         Serial.println("[AUTO_VOL] ps_malloc failed, task halting");
         vTaskDelete(NULL);
         return;
     }
 
-    bool micOwned = false;
+    if (!init_mic_i2s()) {
+        Serial.println("[AUTO_VOL] init_mic_i2s failed");
+    } else {
+        Serial.println("[AUTO_VOL] Permanent Mic I2S initialized");
+    }
 
     while (true) {
         if (ai_pipeline_is_busy()) {
-            if (micOwned) {
-                deinit_mic_i2s();
-                micOwned = false;
-                Serial.println("[AUTO_VOL] Released mic to AI pipeline");
-            }
-            vTaskDelay(pdMS_TO_TICKS(AV_READ_MS));
+            // Khi AI đang thu âm hoặc xử lý -> nhả mic tức thì
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        if (!micOwned) {
-            if (!init_mic_i2s()) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            micOwned = true;
-            Serial.println("[AUTO_VOL] Mic I2S re-acquired");
-        }
-
         size_t bytesRead = 0;
-        esp_err_t err = i2s_read(I2S_MIC_PORT, micBuf,
-                                 AV_READ_SAMPLES * sizeof(int16_t),
+        esp_err_t err = i2s_read(I2S_MIC_PORT, rawBuf,
+                                 AV_READ_SAMPLES * sizeof(int32_t),
                                  &bytesRead, pdMS_TO_TICKS(100));
         if (err != ESP_OK || bytesRead == 0) {
             vTaskDelay(pdMS_TO_TICKS(AV_READ_MS));
             continue;
         }
 
-        int numSamples = bytesRead / sizeof(int16_t);
+        // INMP441: 24-bit data nằm trong slot 32-bit -> shift >>8 (giống test)
+        int numSamples = bytesRead / sizeof(int32_t);
+        for (int i = 0; i < numSamples; i++) {
+            micBuf[i] = (int16_t)(rawBuf[i] >> 8);
+        }
+
         int64_t sumSq = 0;
         for (int i = 0; i < numSamples; i++) {
             sumSq += (int64_t)micBuf[i] * micBuf[i];

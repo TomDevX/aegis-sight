@@ -18,14 +18,14 @@
 // ============================================================================
 //  USER CONFIGURATION HEADER
 // ============================================================================
-#define USER_WIFI_SSID        "HCMUT.EDU"
-#define USER_WIFI_PASS        "Suong72730109"
+#define USER_WIFI_SSID        ""
+#define USER_WIFI_PASS        ""
 
-#define USER_GEMINI_API_KEY   "API"
+#define USER_GEMINI_API_KEY   ""
 
 #define RECORD_TIME_SEC       3
 #define AUDIO_GAIN            2.0f
-#define JPEG_QUALITY          70
+#define JPEG_QUALITY          55
 #define TARGET_GEMINI_MODEL   "gemini-3.5-flash-lite"
 
 // ============================================================================
@@ -77,79 +77,105 @@ static void createWavHeader(uint8_t *header, uint32_t pcmDataLen, uint32_t sampl
 }
 
 // ============================================================
-// 2. LOA GROVE PWM OUTPUT CLASS
+// 2. LOA QUA MAX98357A I2S CLASS-D AMPLIFIER OUTPUT CLASS
+//    DIN=GPIO39, LRC=GPIO40, BCLK=GPIO41 (I2S_SPK_PORT)
+//    ESP32-S3 làm Master TX, MAX98357A decode I2S -> analog -> loa Grove
 // ============================================================
-class SeeedGrovePWMOutput : public AudioOutput {
+class Max98357I2SOutput : public AudioOutput {
 private:
-    uint8_t _pin;
-    uint8_t _channel;
-    uint32_t _sample_rate;
-    uint32_t _last_sample_us;
-    uint32_t _sample_interval_us;
-    bool _is_active;
+    int32_t _sample_rate;
+    bool _installed;
+
+    bool installDriver() {
+        i2s_config_t i2s_cfg = {
+            .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+            .sample_rate = (uint32_t)_sample_rate,
+            .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+            .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+            .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+            .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+            .dma_buf_count = 8,
+            .dma_buf_len = 256,
+            .use_apll = false,
+        };
+
+        i2s_pin_config_t pin_cfg = {
+            .bck_io_num = AMP_I2S_BCLK,
+            .ws_io_num = AMP_I2S_LRC,
+            .data_out_num = AMP_I2S_DIN,
+            .data_in_num = I2S_PIN_NO_CHANGE,
+        };
+
+        if (i2s_driver_install(I2S_SPK_PORT, &i2s_cfg, 0, NULL) != ESP_OK) return false;
+        if (i2s_set_pin(I2S_SPK_PORT, &pin_cfg) != ESP_OK) {
+            i2s_driver_uninstall(I2S_SPK_PORT);
+            return false;
+        }
+        i2s_zero_dma_buffer(I2S_SPK_PORT);
+        return true;
+    }
 
 public:
-    SeeedGrovePWMOutput(uint8_t pin, uint8_t channel = 2) {
-        _pin = pin;
-        _channel = channel;
+    Max98357I2SOutput() {
         _sample_rate = 24000;
-        _sample_interval_us = 1000000 / _sample_rate;
-        _last_sample_us = 0;
-        _is_active = false;
+        _installed = false;
     }
 
     virtual bool SetRate(int hz) override {
-        if (hz > 0) {
-            _sample_rate = hz;
-            _sample_interval_us = 1000000 / _sample_rate;
+        if (hz <= 0) return false;
+        _sample_rate = hz;
+        if (_installed) {
+            // MAX98357A tự đồng hồ theo BCLK, chỉ cần đổi sample rate master
+            if (i2s_set_sample_rates(I2S_SPK_PORT, hz) != ESP_OK) return false;
         }
         return true;
     }
 
     virtual bool begin() override {
-        ledcSetup(_channel, 31250, 8);
-        ledcAttachPin(_pin, _channel);
-
-        for (int b = 0; b <= 128; b++) {
-            ledcWrite(_channel, b);
-            delayMicroseconds(100);
+        if (!_installed) {
+            if (!installDriver()) {
+                Serial.println("[AMP] Lỗi khởi tạo I2S cho MAX98357A!");
+                return false;
+            }
+            _installed = true;
         }
-
-        _last_sample_us = micros();
-        _is_active = true;
+        // Im lặng ban đầu để tránh tiếng "pop" khi bật amp
+        size_t written = 0;
+        static const int16_t silence[64] = {0};
+        for (int i = 0; i < 16; i++) {
+            i2s_write(I2S_SPK_PORT, silence, sizeof(silence), &written, portMAX_DELAY);
+        }
+        Serial.printf("[AMP] MAX98357A sẵn sàng (I2S %ld Hz, DIN=%d LRC=%d BCLK=%d)\n",
+                      _sample_rate, AMP_I2S_DIN, AMP_I2S_LRC, AMP_I2S_BCLK);
         return true;
     }
 
     virtual bool ConsumeSample(int16_t sample[2]) override {
-        if (!_is_active) return true;
+        if (!_installed) return true;
 
-        int32_t pcm = ((int32_t)sample[0] + (int32_t)sample[1]) / 2;
-        pcm = (pcm * 7) / 2;
-        if (pcm > 32767)  pcm = 32767;
-        if (pcm < -32768) pcm = -32768;
+        // Trộn stereo -> mono rồi phát trên cả 2 kênh (loa Grove 1 chiều)
+        int32_t mono = ((int32_t)sample[0] + (int32_t)sample[1]) / 2;
+        int16_t frame[2] = { (int16_t)mono, (int16_t)mono };
 
-        uint8_t duty = (uint8_t)(((pcm + 32768) >> 8) & 0xFF);
-
-        while ((micros() - _last_sample_us) < _sample_interval_us) {
-            #if defined(ESP32)
-            NOP();
-            #endif
+        size_t written = 0;
+        // Block chờ DMA trống — driver MP3 gọi lại liên tục nên không cần busy-wait
+        if (i2s_write(I2S_SPK_PORT, frame, sizeof(frame), &written, portMAX_DELAY) != ESP_OK) {
+            return false;
         }
-        _last_sample_us = micros();
-
-        ledcWrite(_channel, duty);
         return true;
     }
 
     virtual bool stop() override {
-        _is_active = false;
-        for (int b = 128; b >= 0; b--) {
-            ledcWrite(_channel, b);
-            delayMicroseconds(100);
+        if (_installed) {
+            // Phát im lặng để xả DMA, tránh tắt đột ngột gây tiếng "click"
+            size_t written = 0;
+            static const int16_t silence[64] = {0};
+            for (int i = 0; i < 8; i++) {
+                i2s_write(I2S_SPK_PORT, silence, sizeof(silence), &written, portMAX_DELAY);
+            }
+            i2s_driver_uninstall(I2S_SPK_PORT);
+            _installed = false;
         }
-        ledcDetachPin(_pin);
-        pinMode(_pin, OUTPUT);
-        digitalWrite(_pin, LOW);
         return true;
     }
 };
@@ -157,7 +183,7 @@ public:
 static AudioGeneratorMP3 *mp3 = NULL;
 static AudioFileSourceHTTPStream *file = NULL;
 static AudioFileSourceBuffer *buff = NULL;
-static SeeedGrovePWMOutput *out = NULL;
+static Max98357I2SOutput *out = NULL;
 
 // ============================================================
 // 3. KHỞI TẠO MICRO I2S (INMP441)
@@ -365,7 +391,7 @@ static void playGoogleTTS(String text, String lang = "vi") {
 
     file = new AudioFileSourceHTTPStream(url.c_str());
     buff = new AudioFileSourceBuffer(file, TTS_MP3_BUF_SIZE);
-    out = new SeeedGrovePWMOutput(SPK_PWM_PIN, 2);
+    out = new Max98357I2SOutput();
     out->begin();
 
     mp3 = new AudioGeneratorMP3();
@@ -387,8 +413,6 @@ static void playGoogleTTS(String text, String lang = "vi") {
     delete file; file = NULL;
     delete out;  out = NULL;
 
-    pinMode(SPK_PWM_PIN, OUTPUT);
-    digitalWrite(SPK_PWM_PIN, LOW);
     Serial.println("[TTS] Phát xong câu trả lời.");
 }
 
@@ -630,14 +654,11 @@ static bool autoConnectWiFi() {
 // SETUP & LOOP CHÍNH
 // ============================================================
 void setup() {
-    pinMode(SPK_PWM_PIN, OUTPUT);
-    digitalWrite(SPK_PWM_PIN, LOW);
-
     Serial.begin(SERIAL_BAUD);
     delay(500);
 
     Serial.println("\n=======================================================");
-    Serial.println(" AEGIS SIGHT - MIC + CAMERA -> GEMINI AI -> GOOGLE TTS ");
+    Serial.println(" AEGIS SIGHT - MIC + CAM -> GEMINI -> TTS -> MAX98357A ");
     Serial.println("=======================================================");
 
     if (strlen(USER_GEMINI_API_KEY) > 0 && String(USER_GEMINI_API_KEY) != "AIzaSy...") {

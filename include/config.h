@@ -8,16 +8,14 @@
 // ============================================================
 
 // Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
-// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> AI pipeline must use RGB565
-//       capture + software JPEG encode (TBD) or a JPEG-capable sensor.
-// #define ENABLE_CAMERA_OV2640
-// #define ENABLE_SPEAKER_I2S
+#define ENABLE_CAMERA_OV2640
+#define ENABLE_SPEAKER_I2S
 
 // AI Pipeline (Chặng 3 - HTTP REST + Gemini → text → Google TTS)
-// #define ENABLE_AI_PIPELINE
+#define ENABLE_AI_PIPELINE
 
 // Cloud Text-to-Speech (Google Translate TTS) — HTTP MP3 → decode → play
-// #define ENABLE_TTS_CLOUD
+#define ENABLE_TTS_CLOUD
 
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
@@ -38,7 +36,7 @@
 
 // Mic + Camera (image + audio) -> Gemini AI -> Google TTS -> Grove Speaker
 // Chỉ bật 1 test flag tại 1 thời điểm
-#define ENABLE_MIC_AI_CAM_TEST
+// #define ENABLE_MIC_AI_CAM_TEST
 
 // Cloud API Test (Gemini + Google TTS) — standalone, no extra HW needed
 // Comment ALL pipeline flags, uncomment this 1 flag
@@ -48,9 +46,10 @@
 // MAIN PIPELINE (Chặng 2) - Real-time tasks on Core 1
 // Enable these together for the full main build
 // ============================================================
-// #define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
-// #define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
-// #define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
+#define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
+#define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
+#define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
+// #define ENABLE_AUTO_VOLUME         // (Đã loại bỏ hoàn toàn để giải phóng Mic 100% cho AI)
 
 // ============================================================
 // CAMERA - RHYX M21-45 (GC2145, 2MP) - DVP Bus (Right Module - FPC DVP Bus)
@@ -82,38 +81,54 @@
 // ============================================================
 // MICROPHONE INMP441 - I2S RX (Left Module - Channel 0)
 // L/R pin tied to GND = Left channel
+// SCK -> GPIO41, WS -> GPIO42, SD -> GPIO2
 // ============================================================
 #define MIC_BCLK          41  // SCK
 #define MIC_LRCK          42  // WS (LRCK)
 #define MIC_DATA_IN        2  // SD
 
 // ============================================================
-// SPEAKER - Seeed Grove Speaker (4 chân: VDD, GND, SIG, NC)
-// Loa nhận tín hiệu PWM/analog trên chân SIG (ESP32-S3 không có DAC)
-// Dùng LEDC PWM (channel 2, timer 1) để không xung đột camera
-// (camera đang dùng LEDC_CHANNEL_0 / LEDC_TIMER_0 cho XCLK)
-//
-// LƯU Ý: GPIO40 trên board Freenove N16R8 là SD DATA0 (có pull-up
-// khe thẻ SD) -> loa rè liên tục. Đã chuyển sang GPIO21 (tự do sau
-// khi sửa camera pinout: cũ là CAM_HREF).
+// AMPLIFIER MAX98357A - I2S Class D 3W (trước Loa Grove)
+// DIN -> GPIO19, LRC -> GPIO21, BCLK -> GPIO20
+// Nguồn 5V từ Buck, output nối ra Loa Grove.
+// Chạy trên I2S_SPK_PORT (I2S_NUM_1), tách biệt I2S_MIC_PORT (RX).
 // ============================================================
-#define SPK_PWM_PIN        21  // nối vào chân SIG của Grove Speaker
+#define AMP_I2S_DIN       19  // Data In của MAX98357A
+#define AMP_I2S_LRC       21  // LRCK / WS
+#define AMP_I2S_BCLK      20  // BCLK / SCK
 
 // ============================================================
+// SPEAKER - Seeed Grove Speaker (4 chân: VDD, GND, SIG, NC)
+// Loa giờ được cấp tín hiệu analog qua MAX98357A I2S Amp
+// (xem AMP_I2S_* ở trên) - KHÔNG còn dùng LEDC PWM trực tiếp.
+//
+// LEGACY: SPK_PWM_PIN giữ lại chỉ để các file test cũ compile.
+// Không nối gì vào chân này trong sơ đồ mới.
+// ============================================================
+#define SPK_PWM_PIN        21  // (legacy - không dùng trong sơ đồ mới)
+
+// ============================================================
+// FACTORY RESET: press button 5 times quickly on boot (within 3s)
+// ============================================================
+// ============================================================
 // TRIGGER BUTTON (Hỏi AI / Hủy SOS) - Hộp Trái
-// Internal Pull-Up (Active LOW)
+// Internal Pull-Up (Active LOW), Data -> GPIO14, chân còn lại -> GND
+// CẢNH BÁO: KHÔNG dùng GPIO35/36/37 — chúng là chân bus OPI
+// PSRAM trên bo N16R8! Dùng sẽ làm hỏng PSRAM -> crash ngẫu nhiên.
 // ============================================================
 #define BTN_TRIGGER       14
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Hộp Phải, hướng chính diện
+// CẢNH BÁO: KHÔNG dùng GPIO8/9 — trùng CAM_Y4/CAM_Y3 (bus DVP
+// camera cố định). Trig=46, Echo=3 là các chân tự do an toàn.
 // ============================================================
-#define ULTRASONIC_TRIG    8
-#define ULTRASONIC_ECHO    9
+#define ULTRASONIC_TRIG   46
+#define ULTRASONIC_ECHO    3
 
 // ============================================================
-// MPU6050 - I2C (Left Module - Wire     Headband)
-// GPIO48 is the onboard LED — moved SCL to a free pin.
+// MPU6050 - I2C (Left Module)
+// SDA -> GPIO47, SCL -> GPIO39, nguồn 5V từ Buck
 // ============================================================
 #define MPU_SDA           47
 #define MPU_SCL           39
@@ -121,7 +136,7 @@
 // ============================================================
 // SYSTEM CONSTANTS
 // ============================================================
-#define SERIAL_BAUD     2000000
+#define SERIAL_BAUD     2000000  // 2Mbps siêu tốc, giải phóng 95% thời gian in log của CPU
 #define PSRAM_EXPECTED_SIZE (8 * 1024 * 1024)  // 8MB
 
 // ============================================================
@@ -132,11 +147,33 @@
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Beep Thresholds (cm)
-// 3 zones: DANGER | WARNING | SAFE (silent)
+// 4 zones: DANGER (<=18cm) | WARN (18-32cm) | SAFE (32-45cm) | NONE (>45cm, silent)
+// Giới hạn trong 45cm để chỉ báo vật cản gần thiết thực, không báo xa
 // ============================================================
-#define DISTANCE_DANGER    35  // D <= 35cm: beep dồn dập
-#define DISTANCE_WARNING   45  // 35cm < D <= 45cm: beep vừa
-// D > 45cm: im lặng
+#define ZONE_DANGER          18   // D <= 18cm: FAST beep (rất gần)
+#define ZONE_WARN            32   // 18-32cm: MED beep (gần)
+#define ZONE_SAFE            45   // 32-45cm: SLOW beep (chú ý)
+#define ZONE_HYSTERESIS      2    // Hysteresis chống chập chờn ranh giới
+
+// Beep intervals (ms) - khoảng thời gian giữa các hồi chuông
+#define INTERVAL_FAST        180   // DANGER zone (chuông dồn dập 180ms)
+#define INTERVAL_MED         320   // WARN zone (chuông vừa 320ms)
+#define INTERVAL_SLOW        550   // SAFE zone (chuông thong thả 550ms)
+
+// Tone definitions for ultrasonic and fall detection (Silky Smooth Chimes)
+#define TONE_ALARM       1760  // SOS alarm frequency
+#define TONE_DANGER       880  // A5 (La 5) - 880Hz: DANGER zone (<=18cm, êm ái như còi ngã)
+#define TONE_WARNING      740  // F#5 (Fa# 5) - 740Hz: WARN zone (18-32cm)
+#define TONE_SLOW         587  // D5 (Rê 5) - 587Hz: SAFE zone (32-45cm)
+
+// Distance measurement
+#define US_MEASURE_MS        60    // Fast distance sampling (60ms)
+#define US_TIMEOUT_US        15000 // Echo timeout ~2.5m (bỏ qua phản xạ xa)
+#define US_SPEED_CM_US       0.0343f // Sound speed cm/us
+
+// Debug
+#define US_DEBUG             1    // 1=on, 0=off (enable for debugging)
+#define US_DEBUG_INTERVAL    2000
 
 // ============================================================
 // MOTION GATE - MPU6050 accelerometer movement detection
@@ -145,9 +182,9 @@
 // Hysteresis timers prevent gate flicker.
 // ============================================================
 #define MOTION_WINDOW_SAMPLES  25   // 25 samples x 20ms = 500ms window
-#define MOTION_STDDEV_G       0.08  // stddev(SV) above this = moving
-#define MOTION_ON_MS          400   // sustained movement to enable gate
-#define MOTION_OFF_MS         1200  // sustained stillness to disable gate
+#define MOTION_STDDEV_G       0.10  // Motion stddev threshold (g)
+#define MOTION_ON_MS          200   // Enable gate after 200ms of sustained movement
+#define MOTION_OFF_MS         1000  // Disable gate after 1000ms of sustained stillness
 
 // ============================================================
 // FALL DETECTION THRESHOLDS (3-Phase Algorithm)
@@ -160,7 +197,7 @@
 #define FALL_IMPACT_WINDOW   300   // ms window for impact after free-fall
 #define FALL_INACTIVITY_MS   2000  // ms of stillness to confirm fall
 #define FALL_CANCEL_WAIT_MS  10000 // ms to wait for user cancel before SOS
-#define FALL_DEBOUNCE_MS     5000  // cooldown after fall alarm (ms)
+#define FALL_DEBOUNCE_MS     1000  // cooldown 1s sau khi tắt còi ngã (sẵn sàng bắt cú ngã tiếp theo ngay)
 
 // ============================================================
 // AUTO-VOLUME RMS THRESHOLDS (16-bit signed PCM)
@@ -171,17 +208,18 @@
 #define AV_RMS_LOUD       8000    // Street noise -> volume 16
 #define AV_RMS_MAX       16000    // Very loud -> volume 21 (max)
 
-// ============================================================
+// ============================================================ 
 // AI PIPELINE (Chặng 3) - HTTP REST + Gemini
 // ============================================================
 // Multi-Wi-Fi - tự động kết nối vào mạng mạnh nhất trong danh sách
+// ĐIỀN THÔNG TIN CỦA BẠN VÀO ĐÂY (chỉ hỗ trợ Wi-Fi 2.4GHz):
 #define WIFI_SSID               ""
 #define WIFI_PASS               ""
 #define WIFI_SSID2              ""
 #define WIFI_PASS2              ""
 #define WIFI_SSID3              ""
 #define WIFI_PASS3              ""
-#define GEMINI_API_KEY          ""
+#define GEMINI_API_KEY          "" 
 #define GEMINI_MODEL            "models/gemini-3.5-flash-lite"
 #define GEMINI_MODEL_SHORT      "gemini-3.5-flash-lite"
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
@@ -192,6 +230,11 @@
 #define AI_AUDIO_SAMPLE_RATE    16000
 #define AI_AUDIO_MAX_RECORD_MS  8000
 #define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
+#define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
+
+// JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
+#define AI_JPEG_QUALITY          40   // Tối ưu 40: ảnh cực nhẹ (~8KB), nén & upload siêu tốc, AI nhận diện chuẩn xác
+#define AI_JPEG_BUF_SIZE         (128 * 1024)
 
 // Ring buffer for TTS/response audio playback (PSRAM)
 // Larger buffer (256KB) to accommodate local TTS PCM generation
@@ -208,6 +251,6 @@
 // ============================================================
 #define TTS_MAX_TEXT_LEN        8192       // Max accumulated text from SSE response
 #define TTS_CLOUD_MAX_CHARS     200        // Google TTS limit (~200 chars per request)
-#define TTS_MP3_BUF_SIZE        (64 * 1024) // PSRAM buffer for downloaded MP3
+#define TTS_MP3_BUF_SIZE        (128 * 1024) // PSRAM buffer for downloaded MP3
 
 #endif // CONFIG_H
