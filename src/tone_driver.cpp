@@ -17,7 +17,7 @@
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;
 static volatile bool toneStopFlag = false;
-static volatile uint8_t currentVolume = 18; // Mức âm lượng chuẩn rõ, không méo
+static volatile uint8_t currentVolume = 21; // Âm lượng cực đại (Max 21)
 
 static QueueHandle_t toneQueue = NULL;
 static uint32_t currentSampleRate = TONE_SAMPLE_RATE;
@@ -77,10 +77,10 @@ void tone_driver_set_sample_rate(uint32_t rate) {
 static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
     static int16_t frame[512][2];
     
-    // Thang âm lượng 1..21: dải scale 0.40f .. 1.05f cho giọng nói AI cực to rõ và đầy đặn
+    // Thang âm lượng 1..21: dải scale 0.70f .. 1.50f cho âm lượng cực đại, to vang khắp phòng
     float volScale = 0.0f;
     if (currentVolume > 0) {
-        volScale = 0.40f + (float)(currentVolume - 1) * (0.65f / 20.0f);
+        volScale = 0.70f + (float)(currentVolume - 1) * (0.80f / 20.0f);
     }
 
     uint32_t pos = 0;
@@ -90,8 +90,8 @@ static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(v
         if (chunk > 512) chunk = 512;
 
         for (uint32_t i = 0; i < chunk; i++) {
-            int32_t s = (int32_t)(buf[pos + i] * volScale);
-            // Soft clipping
+            int32_t s = (int32_t)((float)buf[pos + i] * volScale);
+            // Soft clipping an toàn
             if (s > 32000) s = 32000;
             else if (s < -32000) s = -32000;
             frame[i][0] = (int16_t)s;

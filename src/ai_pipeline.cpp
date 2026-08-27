@@ -205,7 +205,9 @@ static bool try_ssid(const char *ssid, const char *pass, int tries) {
         vTaskDelay(pdMS_TO_TICKS(250)); c++;
     }
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WIFI] OK! IP: %s\n", WiFi.localIP().toString().c_str());
+        // Cấu hình Google Public DNS (8.8.8.8) và Cloudflare DNS (1.1.1.1) chống lỗi DNS Failed
+        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8), IPAddress(1, 1, 1, 1));
+        Serial.printf("[WIFI] OK! IP: %s | DNS: 8.8.8.8\n", WiFi.localIP().toString().c_str());
         return true;
     }
     Serial.println("[WIFI] Thất bại");
@@ -370,13 +372,13 @@ static size_t record_until_release(void) {
         for (size_t i = 0; i < count; i++) {
             if (samples >= AI_AUDIO_MAX_SAMPLES) break;
 
-            // Đưa mẫu 24-bit từ INMP441 về 16-bit chuẩn xác không méo tiếng
+            // Đưa mẫu 24-bit từ INMP441 về 16-bit nguyên bản sạch 100%
             int32_t s16 = rawBuf[i] >> 14;
             float sample = (float)s16;
 
             // Khử DC offset tự nhiên
-            dc_offset = 0.995f * dc_offset + 0.005f * sample;
-            float clean = (sample - dc_offset) * 3.0f;
+            dc_offset = 0.999f * dc_offset + 0.001f * sample;
+            float clean = sample - dc_offset;
 
             if (clean > 32000.0f) clean = 32000.0f;
             else if (clean < -32000.0f) clean = -32000.0f;
@@ -390,6 +392,19 @@ static size_t record_until_release(void) {
     }
 
     free(rawBuf);
+
+    // Tự động chuẩn hóa âm lượng (Clean Normalization) về mức chuẩn vàng 18000 Peak (-5 dBFS)
+    if (samples > 0 && maxPeak > 300 && maxPeak < 18000) {
+        float normFactor = 18000.0f / (float)maxPeak;
+        if (normFactor > 5.0f) normFactor = 5.0f;
+        for (size_t i = 0; i < samples; i++) {
+            float s = (float)recordBuf[i] * normFactor;
+            if (s > 30000.0f) s = 30000.0f;
+            else if (s < -30000.0f) s = -30000.0f;
+            recordBuf[i] = (int16_t)s;
+        }
+        Serial.printf("[AI] Đã chuẩn hóa âm lượng mic sạch sẽ: Gain x%.2f (Peak mới: 18000)\n", normFactor);
+    }
 
     unsigned long elapsedMs = millis() - start;
     float rms = (samples > 0) ? sqrtf(sumSq / samples) : 0.0f;
@@ -495,6 +510,9 @@ static void ai_audio_task(void *pv) {
                 // 1. Thu âm mic NGAY LẬP TỨC từ mili-giây đầu tiên khi giữ nút
                 recordSamples = record_until_release();
 
+                // Âm thanh báo hiệu ngay khi thả nút: Tít nhẹ 60ms (báo đã nhận lệnh và đang xử lý)
+                tone_driver_play(1320, 60, 18);
+
                 // 2. Chụp ảnh ngay khi vừa thả nút
                 if (!capture_jpeg()) {
                     pipelineBusy = false;
@@ -557,7 +575,17 @@ static String send_audio_image_to_gemini(void) {
     client.setTimeout(25);
 
     Serial.println("[NET] Đang kết nối tới Gemini API...");
-    if (!client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
+    bool connected = false;
+    for (int retry = 0; retry < 3; retry++) {
+        if (client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
+            connected = true;
+            break;
+        }
+        Serial.printf("[NET] Đang kết nối lại Gemini API (lần %d/3)...\n", retry + 1);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+
+    if (!connected) {
         Serial.println("[NET] Kết nối AI thất bại!");
         return "";
     }
@@ -600,10 +628,11 @@ static String send_audio_image_to_gemini(void) {
     }
 
     // 3. Đóng gói JSON: Text chỉ thị trực tiếp (Part 0) -> Audio WAV (Part 1) -> Ảnh JPEG (Part 2)
-    String promptText = "Bạn là trợ lý AI cho người khiếm thị. Người dùng đang nói câu hỏi trong file audio đính kèm ngay sau đây. "
-                        "Hãy lắng nghe kỹ audio và trả lời đúng trọng tâm câu hỏi đó bằng tiếng Việt (dưới 25 từ). "
-                        "Nếu câu hỏi liên quan đến đồ vật trước mặt thì hãy nhìn bức ảnh đính kèm để trả lời. "
-                        "Chỉ khi nào trong audio hoàn toàn im lặng không có tiếng người nói thì bạn mới mô tả bức ảnh.";
+    String promptText = "Bạn là trợ lý AI thông minh Aegis Sight. "
+                        "File audio đính kèm là prompt (có thể chứa tiếng lóng, tiếng Việt, thuật ngữ)"
+                        "Nhiệm vụ: Hãy lắng nghe audio, hiểu đúng ý câu hỏi của người dùng và TRẢ LỜI NGAY ĐÁP ÁN CHÍNH XÁC bằng tiếng Việt (ngắn gọn dưới 35 từ, không lặp lại câu hỏi). "
+                        "Chỉ mô tả ảnh nếu trong audio không có yêu cầu nào, im lặng hoặc trong prompt audio yêu cầu đọc hình ảnh."
+                        "Nếu không trả lời được hay không hiểu trong file audio nói gì thì hãy báo là audio không rõ rồi mô tả hình ảnh";
 
     String jsonHeader = "{\"contents\":[{\"parts\":["
                         "{\"text\":\"" + promptText + "\"},"
@@ -758,6 +787,8 @@ static String send_audio_image_to_gemini(void) {
     return fullReply;
 }
 
+#include "offline_sounds.h"
+
 // ============================================================
 // Core 0 task chính
 // ============================================================
@@ -777,12 +808,20 @@ static void ai_net_task(void *pv) {
 
         if (!ensure_wifi()) {
             Serial.println("[NET] Bỏ lượt hỏi — Wi-Fi không kết nối được");
+            // Phát trực tiếp giọng nói OFFLINE: "Kết nối không thành công"
+            Serial.println("[AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<");
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
+
             pipelineBusy = false; dataReady = false;
             continue;
         }
         if (!creds_loaded) wifi_creds_refresh();
         if (cached_api_key.length() == 0) {
             Serial.println("[NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!");
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
+
             pipelineBusy = false; dataReady = false;
             continue;
         }
@@ -798,6 +837,18 @@ static void ai_net_task(void *pv) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
             vTaskDelay(pdMS_TO_TICKS(150));
+            tone_driver_stream_set_active(false);
+
+            // Tiếng chuông máy bay (Airplane Chime Ding-Dong) báo hiệu hoàn thành trả lời
+            tone_driver_play(784, 160, 19); // Nốt G5 (Ding) 160ms
+            vTaskDelay(pdMS_TO_TICKS(190));
+            tone_driver_play(523, 280, 20); // Nốt C5 (Dong) 280ms ngân vang
+            vTaskDelay(pdMS_TO_TICKS(300));
+        } else if (pipelineBusy) {
+            // Khi kết nối thất bại (SSL/DNS/Server Error) -> Phát giọng nói OFFLINE: "Kết nối không thành công"
+            Serial.println("[AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<");
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
         }
 
         tone_driver_stream_set_active(false);

@@ -22,6 +22,7 @@ void    tone_driver_stop(void);
 bool    tone_driver_is_playing(void);
 void    tone_driver_set_volume(uint8_t vol);
 uint8_t tone_driver_get_volume(void);
+void    tone_driver_set_sample_rate(uint32_t rate);
 
 void    tone_driver_stream_init(void);
 bool    tone_driver_stream_write(const int16_t *data, size_t samples);

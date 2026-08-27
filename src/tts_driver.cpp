@@ -52,6 +52,9 @@ public:
     }
 
     virtual bool SetRate(int hz) override {
+        if (hz >= 8000 && hz <= 48000) {
+            tone_driver_set_sample_rate(hz);
+        }
         return true;
     }
 
@@ -64,15 +67,21 @@ public:
     }
 
     virtual bool ConsumeSample(int16_t sample[2]) override {
-        // Gộp 2 kênh stereo thành mono và tăng cường âm lượng Pre-amp Gain x2.2 cho giọng nói AI to rõ
+        // Gộp stereo thành mono chuẩn
         int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
-        int32_t boosted = (mixed * 22) / 10; // 2.2x Digital Gain Boost
 
-        // Soft limiting bảo vệ chống vỡ màng loa
-        if (boosted > 31000) boosted = 31000;
-        else if (boosted < -31000) boosted = -31000;
+        // Khuếch đại mạnh mẽ 2.8x cho âm lượng cực kỳ to vang, rõ từng từ
+        float x = (float)mixed * 2.8f;
+        if (x > 26000.0f) {
+            x = 26000.0f + (x - 26000.0f) * 0.25f;
+        } else if (x < -26000.0f) {
+            x = -26000.0f + (x + 26000.0f) * 0.25f;
+        }
 
-        monoChunk[chunkIdx++] = (int16_t)boosted;
+        if (x > 32000.0f) x = 32000.0f;
+        else if (x < -32000.0f) x = -32000.0f;
+
+        monoChunk[chunkIdx++] = (int16_t)x;
 
         if (chunkIdx >= 128) {
             size_t written = 0;
@@ -221,6 +230,36 @@ void tts_driver_speak(const char *text, size_t len) {
     delete out;
     free(mp3Buf);
 
+    ttsBusy = false;
+}
+
+// Phát âm thanh MP3 Offline từ bộ nhớ Flash ROM (PROGMEM) không cần mạng
+void tts_driver_play_progmem(const uint8_t *data, size_t len) {
+    if (!data || len == 0) return;
+    ttsBusy = true;
+    ttsCancel = false;
+
+    AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(data, len);
+    AudioOutputToToneDriver *out = new AudioOutputToToneDriver();
+    AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+
+    out->begin();
+
+    if (mp3->begin(file, out)) {
+        uint32_t loopCount = 0;
+        while (mp3->isRunning() && !ttsCancel) {
+            if (!mp3->loop()) break;
+            loopCount++;
+            if ((loopCount & 0x07) == 0) taskYIELD();
+        }
+    } else {
+        Serial.println("[TTS] mp3->begin PROGMEM thất bại!");
+    }
+
+    out->stop();
+    delete mp3;
+    delete file;
+    delete out;
     ttsBusy = false;
 }
 
