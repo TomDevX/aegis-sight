@@ -64,9 +64,15 @@ public:
     }
 
     virtual bool ConsumeSample(int16_t sample[2]) override {
-        // Gộp 2 kênh stereo thành mono chuẩn
-        int16_t mono = (int16_t)(((int32_t)sample[0] + (int32_t)sample[1]) >> 1);
-        monoChunk[chunkIdx++] = mono;
+        // Gộp 2 kênh stereo thành mono và tăng cường âm lượng Pre-amp Gain x2.2 cho giọng nói AI to rõ
+        int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
+        int32_t boosted = (mixed * 22) / 10; // 2.2x Digital Gain Boost
+
+        // Soft limiting bảo vệ chống vỡ màng loa
+        if (boosted > 31000) boosted = 31000;
+        else if (boosted < -31000) boosted = -31000;
+
+        monoChunk[chunkIdx++] = (int16_t)boosted;
 
         if (chunkIdx >= 128) {
             size_t written = 0;
@@ -111,26 +117,27 @@ void tts_driver_speak(const char *text, size_t len) {
     if (!mp3Buf) { ttsBusy = false; return; }
 
     String enc = url_encode_str(String(text));
-    String path = "/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q=" + enc;
 
     Serial.printf("[TTS] Đang tải & phát: \"%.40s...\"\n", text);
 
     size_t mp3Len = 0;
 
-    // 2. Tải toàn bộ MP3 vào RAM qua WiFiClient có timeout chặt chẽ
-    for (int retry = 0; retry < 2 && mp3Len == 0 && !ttsCancel; retry++) {
+    // 2. Tải toàn bộ MP3 vào RAM qua WiFiClient với dual-endpoint fallback (gtx -> tw-ob)
+    for (int retry = 0; retry < 3 && mp3Len == 0 && !ttsCancel; retry++) {
         WiFiClient client;
-        client.setTimeout(2500);
+        client.setTimeout(1800);
 
         if (!client.connect("translate.google.com", 80)) {
-            Serial.printf("[TTS] Ket noi that bai (lan %d)\n", retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
+        const char *clientType = (retry == 0) ? "gtx" : "tw-ob";
+        String path = "/translate_tts?ie=UTF-8&tl=vi&client=" + String(clientType) + "&q=" + enc;
+
         String req = "GET " + path + " HTTP/1.1\r\n"
                      "Host: translate.google.com\r\n"
-                     "User-Agent: Mozilla/5.0\r\n"
+                     "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
                      "Connection: close\r\n\r\n";
         client.print(req);
 
@@ -160,11 +167,11 @@ void tts_driver_speak(const char *text, size_t len) {
             continue;
         }
 
-        // Tải body MP3
+        // Tải body MP3 siêu tốc
         while (mp3Len < TTS_MP3_BUF_SIZE && !ttsCancel) {
             if (client.available()) {
                 int room = TTS_MP3_BUF_SIZE - mp3Len;
-                int got = client.read(mp3Buf + mp3Len, room > 1024 ? 1024 : room);
+                int got = client.read(mp3Buf + mp3Len, room > 2048 ? 2048 : room);
                 if (got <= 0) break;
                 mp3Len += got;
             } else if (!client.connected()) {
@@ -184,7 +191,7 @@ void tts_driver_speak(const char *text, size_t len) {
 
     Serial.printf("[TTS] Tải xong %zu bytes MP3. Bắt đầu giải mã...\n", mp3Len);
 
-    // 3. Giải mã từ RAM bằng AudioFileSourcePROGMEM (100% không bị nghẽn mạng trong lúc decode)
+    // 3. Giải mã siêu tốc từ RAM bằng AudioFileSourcePROGMEM
     AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(mp3Buf, mp3Len);
     AudioOutputToToneDriver *out = new AudioOutputToToneDriver();
     AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
@@ -192,12 +199,16 @@ void tts_driver_speak(const char *text, size_t len) {
     out->begin();
 
     if (mp3->begin(file, out)) {
+        uint32_t loopCount = 0;
         while (mp3->isRunning() && !ttsCancel) {
             if (!mp3->loop()) {
                 break;
             }
-            // Nhả CPU cho IDLE0 task để không bao giờ bị watchdog TWDT abort
-            vTaskDelay(pdMS_TO_TICKS(1));
+            loopCount++;
+            // Nhả CPU định kỳ mỗi 8 frame để giải mã siêu nhanh mà không bị Watchdog
+            if ((loopCount & 0x07) == 0) {
+                taskYIELD();
+            }
         }
     } else {
         Serial.println("[TTS] mp3->begin thất bại!");

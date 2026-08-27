@@ -1,10 +1,15 @@
 #include "mpu_manager.h"
 #include "config.h"
 #include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 
-static Adafruit_MPU6050 mpu;
+// MPU6050 Registers
+#define MPU_REG_SMPLRT_DIV   0x19
+#define MPU_REG_CONFIG       0x1A
+#define MPU_REG_ACCEL_CONFIG 0x1C
+#define MPU_REG_ACCEL_XOUT_H 0x3B
+#define MPU_REG_PWR_MGMT_1   0x6B
+#define MPU_REG_WHO_AM_I     0x75
+
 static SemaphoreHandle_t i2cMutex = NULL;
 static bool mpuInitialized = false;
 static float lastSvG = 1.0f;
@@ -14,9 +19,54 @@ static float lastAzG = 1.0f;
 static unsigned long lastReadMs = 0;
 static int i2cErrorCount = 0;
 
-// EMA filter to smooth out transient spikes from I2C noise
+// EMA filter to smooth out transient spikes
 static float emaSvG = 1.0f;
 #define MPU_EMA_ALPHA  0.25f   // Low-pass: 25% new data, 75% history
+static uint8_t activeMpuAddr = 0x68;
+
+static bool write_reg(uint8_t addr, uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(val);
+    return (Wire.endTransmission(true) == 0);
+}
+
+static void recover_i2c_bus(void) {
+    Wire.end();
+    pinMode(MPU_SDA, INPUT_PULLUP);
+    pinMode(MPU_SCL, OUTPUT);
+    digitalWrite(MPU_SCL, HIGH);
+    delayMicroseconds(10);
+
+    // Gửi 9 xung SCL clock để MPU nhả chân SDA đang bị kéo giữ
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(MPU_SCL, LOW);
+        delayMicroseconds(10);
+        digitalWrite(MPU_SCL, HIGH);
+        delayMicroseconds(10);
+    }
+
+    // Tạo I2C Stop Condition thủ công
+    pinMode(MPU_SDA, OUTPUT);
+    digitalWrite(MPU_SDA, LOW);
+    delayMicroseconds(10);
+    digitalWrite(MPU_SCL, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(MPU_SDA, HIGH);
+    delayMicroseconds(10);
+
+    // Khởi động lại I2C Bus & Khởi tạo lại MPU6050
+    pinMode(MPU_SDA, INPUT_PULLUP);
+    pinMode(MPU_SCL, INPUT_PULLUP);
+    Wire.begin(MPU_SDA, MPU_SCL);
+    Wire.setClock(50000);
+    Wire.setTimeOut(30);
+
+    write_reg(activeMpuAddr, MPU_REG_PWR_MGMT_1, 0x00);
+    delayMicroseconds(2000);
+    write_reg(activeMpuAddr, MPU_REG_CONFIG, 0x03);
+    write_reg(activeMpuAddr, MPU_REG_ACCEL_CONFIG, 0x10);
+}
 
 bool mpu_manager_init(void) {
     if (mpuInitialized) return true;
@@ -38,74 +88,102 @@ bool mpu_manager_init(void) {
         return true;
     }
 
+    pinMode(MPU_SDA, INPUT_PULLUP);
+    pinMode(MPU_SCL, INPUT_PULLUP);
     Wire.begin(MPU_SDA, MPU_SCL);
-    Wire.setClock(50000); // 50kHz - chống nhiễu bus I2C cho dây nối mềm
-    Wire.setTimeOut(40);  // 40ms timeout
+    Wire.setClock(50000); // 50kHz - Tần số tối ưu cho dây nối dài chống suy hao
+    Wire.setTimeOut(50);
 
     bool mpuFound = false;
-    uint8_t foundAddr = 0;
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (mpu.begin(0x68, &Wire)) {
-            mpuFound = true;
-            foundAddr = 0x68;
-            break;
+    uint8_t foundAddr = 0x68;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        Wire.beginTransmission(0x68);
+        Wire.write(MPU_REG_WHO_AM_I);
+        if (Wire.endTransmission(false) == 0) {
+            if (Wire.requestFrom((uint8_t)0x68, (size_t)1, (bool)true) == 1) {
+                mpuFound = true;
+                foundAddr = 0x68;
+                break;
+            }
         }
-        if (mpu.begin(0x69, &Wire)) {
-            mpuFound = true;
-            foundAddr = 0x69;
-            break;
+
+        Wire.beginTransmission(0x69);
+        Wire.write(MPU_REG_WHO_AM_I);
+        if (Wire.endTransmission(false) == 0) {
+            if (Wire.requestFrom((uint8_t)0x69, (size_t)1, (bool)true) == 1) {
+                mpuFound = true;
+                foundAddr = 0x69;
+                break;
+            }
         }
-        Serial.printf("[MPU_MGR] Init attempt %d failed, retrying...\n", attempt + 1);
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 
     if (!mpuFound) {
-        Serial.println("[MPU_MGR] MPU6050 not found at 0x68 or 0x69!");
-        xSemaphoreGive(i2cMutex);
-        return false;
+        Serial.println("[MPU_MGR] WARN: MPU6050 not responding at 0x68 or 0x69. Check SDA=47, SCL=39, VCC/GND!");
+        foundAddr = 0x68;
     }
 
-    // 8G range: đủ để detect impact ngã người (~2-8G)
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    activeMpuAddr = foundAddr;
+
+    // Đánh thức và cấu hình MPU6050
+    write_reg(activeMpuAddr, MPU_REG_PWR_MGMT_1, 0x00);
+    delay(10);
+    write_reg(activeMpuAddr, MPU_REG_CONFIG, 0x03);       // DLPF 44Hz
+    write_reg(activeMpuAddr, MPU_REG_ACCEL_CONFIG, 0x10); // +-8G range
 
     mpuInitialized = true;
     i2cErrorCount = 0;
     emaSvG = 1.0f;
     xSemaphoreGive(i2cMutex);
-    Serial.printf("[MPU_MGR] MPU6050 initialized at 0x%02X (8G range, 21Hz DLPF, 50kHz I2C)\n", foundAddr);
+    Serial.printf("[MPU_MGR] MPU6050 I2C Ready at 0x%02X (+-8G, 44Hz DLPF, 50kHz)\n", foundAddr);
     return true;
 }
 
 bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float *out_svG) {
     if (!mpuInitialized) return false;
 
-    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(25)) != pdTRUE) {
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
         return false;
     }
 
-    sensors_event_t a, g, temp;
-    bool success = mpu.getEvent(&a, &g, &temp);
+    bool readSuccess = false;
+    int16_t rawAx = 0, rawAy = 0, rawAz = 0;
 
+    Wire.beginTransmission(activeMpuAddr);
+    Wire.write(MPU_REG_ACCEL_XOUT_H);
+    if (Wire.endTransmission(false) == 0) {
+        if (Wire.requestFrom((uint8_t)activeMpuAddr, (size_t)6, (bool)true) == 6) {
+            rawAx = (int16_t)((Wire.read() << 8) | Wire.read());
+            rawAy = (int16_t)((Wire.read() << 8) | Wire.read());
+            rawAz = (int16_t)((Wire.read() << 8) | Wire.read());
+            readSuccess = true;
+        }
+    }
+
+    if (!readSuccess) {
+        i2cErrorCount++;
+        if (i2cErrorCount >= 3) {
+            recover_i2c_bus();
+            i2cErrorCount = 0;
+        }
+        xSemaphoreGive(i2cMutex);
+        return false;
+    }
+
+    i2cErrorCount = 0;
     xSemaphoreGive(i2cMutex);
 
-    if (!success) {
-        i2cErrorCount++;
-        return false;
-    }
-
-    // Convert m/s^2 to G
-    float ax = a.acceleration.x / 9.80665f;
-    float ay = a.acceleration.y / 9.80665f;
-    float az = a.acceleration.z / 9.80665f;
+    // Chuyển đổi sang đơn vị G (+-8G range -> 4096.0f LSB/G)
+    float ax = (float)rawAx / 4096.0f;
+    float ay = (float)rawAy / 4096.0f;
+    float az = (float)rawAz / 4096.0f;
     float sv = sqrtf(ax * ax + ay * ay + az * az);
 
-    // Lọc lỗi I2C bus buffer rỗng:
-    // Cảm biến cơ điện tử thật không bao giờ trả về đúng chính xác tuyệt đối ax=0, ay=0, az=0.
-    // Nếu cả 3 trục đều = 0.000000 hoặc nhiệt độ = 0/NaN -> 100% là I2C bus error, bỏ qua ngay.
-    if (isnan(sv) || sv > 16.0f || (fabsf(ax) < 0.0001f && fabsf(ay) < 0.0001f && fabsf(az) < 0.0001f)) {
-        i2cErrorCount++;
+    // Lọc dữ liệu lỗi bất thường
+    if (isnan(sv) || sv > 16.0f || sv < 0.25f || (rawAx == 0 && rawAy == 0 && rawAz == 0)) {
         return false;
     }
 

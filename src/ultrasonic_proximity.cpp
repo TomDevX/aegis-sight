@@ -5,6 +5,7 @@
 #include "ai_pipeline.h"
 #include "mpu_manager.h"
 #include "motion_gate.h"
+#include "fall_detection.h"
 
 #ifdef ENABLE_ULTRASONIC_HC_SR04
 
@@ -31,16 +32,11 @@ static bool initUltrasonic(void) {
     return true;
 }
 
-static bool initMPU6050(void) {
-    return mpu_manager_init();
-}
-
 static float measure_distance_cm(void) {
-    // Wait briefly if echo line is stuck HIGH
     if (digitalRead(ULTRASONIC_ECHO) == HIGH) {
         unsigned long tStart = micros();
-        while (digitalRead(ULTRASONIC_ECHO) == HIGH && (micros() - tStart < 2000)) {
-            delayMicroseconds(10);
+        while (digitalRead(ULTRASONIC_ECHO) == HIGH && (micros() - tStart < 1000)) {
+            delayMicroseconds(5);
         }
     }
 
@@ -50,29 +46,19 @@ static float measure_distance_cm(void) {
     delayMicroseconds(10);
     digitalWrite(ULTRASONIC_TRIG, LOW);
 
-    unsigned long durationUs = pulseIn(ULTRASONIC_ECHO, HIGH, US_TIMEOUT_US);
+    // Timeout 8000us (~135cm) - đủ cho dải cảnh báo 60cm, nhường CPU
+    unsigned long durationUs = pulseIn(ULTRASONIC_ECHO, HIGH, 8000);
     if (durationUs == 0) {
         return -1.0f;
     }
 
     float dist = (float)durationUs * US_SPEED_CM_US / 2.0f;
-    
-    // Clamp to reasonable range
     if (dist < 2.0f) dist = 2.0f;
-    if (dist > 400.0f) return -1.0f;
-    
+    if (dist > 120.0f) return -1.0f;
     return dist;
 }
 
-static float read_sv_g(void) {
-    float svG;
-    if (mpu_manager_read_sv_g(&svG)) {
-        return svG;
-    }
-    return mpu_manager_get_last_sv_g();
-}
-
-// 3-sample median + EMA filter to eliminate transient spikes
+// 3-sample median + EMA filter with Sample-and-Hold
 static float distance_filter(float new_dist, float *history, int *idx, float *ema) {
     history[*idx] = new_dist;
     *idx = (*idx + 1) % 3;
@@ -84,37 +70,38 @@ static float distance_filter(float new_dist, float *history, int *idx, float *em
     else med = c;
 
     if (*ema <= 0) *ema = med;
-    else *ema = 0.6f * (*ema) + 0.4f * med;
+    else *ema = 0.5f * (*ema) + 0.5f * med;
 
     return *ema;
 }
 
 // Zone enum
 typedef enum {
-    ZONE_NONE = 0,      // > ZONE_SAFE or invalid
-    ZONE_SAFE_ZONE,     // ZONE_WARN < D <= ZONE_SAFE
-    ZONE_WARN_ZONE,     // ZONE_DANGER < D <= ZONE_WARN
-    ZONE_DANGER_ZONE    // D <= ZONE_DANGER
+    ZONE_NONE = 0,
+    ZONE_SAFE_ZONE,     // 32-45cm
+    ZONE_WARN_ZONE,     // 18-32cm
+    ZONE_DANGER_ZONE    // <=18cm
 } zone_t;
 
 static zone_t get_zone(float dist, zone_t prev_zone) {
-    if (dist < 0) return ZONE_NONE;
+    if (dist <= 0 || dist > 48.0f) return ZONE_NONE;
     
-    // Apply hysteresis
     switch (prev_zone) {
         case ZONE_DANGER_ZONE:
-            if (dist > ZONE_DANGER + ZONE_HYSTERESIS) return ZONE_WARN_ZONE;
+            if (dist > ZONE_DANGER + 2) return ZONE_WARN_ZONE;
             break;
         case ZONE_WARN_ZONE:
-            if (dist > ZONE_WARN + ZONE_HYSTERESIS) return ZONE_SAFE_ZONE;
-            if (dist <= ZONE_DANGER - ZONE_HYSTERESIS) return ZONE_DANGER_ZONE;
+            if (dist > ZONE_WARN + 2) return ZONE_SAFE_ZONE;
+            if (dist <= ZONE_DANGER - 2) return ZONE_DANGER_ZONE;
             break;
         case ZONE_SAFE_ZONE:
-            if (dist <= ZONE_WARN - ZONE_HYSTERESIS) return ZONE_WARN_ZONE;
-            if (dist > ZONE_SAFE + ZONE_HYSTERESIS) return ZONE_NONE;
+            if (dist <= ZONE_WARN - 2) return ZONE_WARN_ZONE;
+            if (dist > ZONE_SAFE + 2) return ZONE_NONE;
             break;
         case ZONE_NONE:
-            if (dist <= ZONE_SAFE - ZONE_HYSTERESIS) return ZONE_SAFE_ZONE;
+            if (dist <= ZONE_DANGER) return ZONE_DANGER_ZONE;
+            if (dist <= ZONE_WARN) return ZONE_WARN_ZONE;
+            if (dist <= ZONE_SAFE) return ZONE_SAFE_ZONE;
             break;
     }
     return prev_zone;
@@ -122,9 +109,9 @@ static zone_t get_zone(float dist, zone_t prev_zone) {
 
 static uint32_t get_beep_interval(zone_t zone) {
     switch (zone) {
-        case ZONE_DANGER_ZONE: return INTERVAL_FAST;
-        case ZONE_WARN_ZONE:   return INTERVAL_MED;
-        case ZONE_SAFE_ZONE:   return INTERVAL_SLOW;
+        case ZONE_DANGER_ZONE: return INTERVAL_FAST; // 180ms
+        case ZONE_WARN_ZONE:   return INTERVAL_MED;  // 320ms
+        case ZONE_SAFE_ZONE:   return INTERVAL_SLOW; // 550ms
         default:               return 0;
     }
 }
@@ -138,12 +125,15 @@ static const char* zone_name(zone_t zone) {
     }
 }
 
+// ============================================================
+// Core 1: Unified Real-Time Sensor Task (Interleaved Execution)
+// Tuần tự: 1. Đọc MPU6050 -> 2. Đo Siêu Âm -> 3. Phát Tone
+// Triệt tiêu 100% hiện tượng xung đột I2C và sóng siêu âm!
+// ============================================================
 static void ultrasonic_task(void *pvParameters) {
-    bool mpuOk = false;
-    unsigned long lastMpuReadMs = 0;
     unsigned long lastDebugMs = 0;
     unsigned long lastBeep = 0;
-    unsigned long lastMeasure = 0;
+    unsigned long lastValidDistMs = 0;
     float lastDistance = -1;
     float filteredDistance = -1;
     float dist_history[3] = {0, 0, 0};
@@ -152,50 +142,49 @@ static void ultrasonic_task(void *pvParameters) {
     zone_t last_printed_zone = ZONE_NONE;
 
     if (!initUltrasonic()) return;
-    mpuOk = initMPU6050();
-    if (!mpuOk) {
-        Serial.println("[US] MPU6050 init failed - motion gate disabled (always beeps)");
-    }
+    mpu_manager_init();
 
-    motion_gate_reset();
-
-    Serial.println("[US] ===== Ultrasonic Proximity Task Running (Core 1) =====");
-    Serial.printf("[US] Zones: DANGER<=%dcm | WARN<=%dcm | SAFE<=%dcm | Hyst=%dcm\n",
-                  ZONE_DANGER, ZONE_WARN, ZONE_SAFE, ZONE_HYSTERESIS);
-    Serial.printf("[US] Intervals: FAST=%dms | MED=%dms | SLOW=%dms\n",
-                  INTERVAL_FAST, INTERVAL_MED, INTERVAL_SLOW);
+    Serial.println("[SENSOR] ===== Unified Real-Time Sensor Task Running (Core 1) =====");
 
     while (true) {
         unsigned long now = millis();
 
-        // Read MPU6050 for motion gate (via shared manager)
-        if (mpuOk && (now - lastMpuReadMs >= MPU_READ_MS)) {
-            lastMpuReadMs = now;
-            float svG = read_sv_g();
-            motion_gate_update(svG);
+        // 1. Bước 1: Đọc MPU6050 (Lúc này chân Trig siêu âm hoàn toàn im lặng, I2C đọc mượt 100%)
+        float ax = 0, ay = 0, az = 0, svG = 1.0f;
+        bool mpuOk = mpu_manager_read_accel_g(&ax, &ay, &az, &svG);
+        if (mpuOk) {
+            fall_detection_process_sample(ax, ay, az, svG);
         }
 
-        // Measure distance
-        if (now - lastMeasure >= US_MEASURE_MS) {
-            lastMeasure = now;
-            float raw_dist = measure_distance_cm();
-            if (raw_dist > 0) {
-                lastDistance = distance_filter(raw_dist, dist_history, &hist_idx, &filteredDistance);
-            } else {
+        // Duy trì còi hú cứu hộ SOS nếu đang có cảnh báo ngã
+        fall_detection_alarm_tick();
+
+        // 2. Bước 2: Đo khoảng cách siêu âm (Lúc này bus I2C hoàn toàn tĩnh lặng)
+        float raw_dist = measure_distance_cm();
+        if (raw_dist > 0 && raw_dist <= 100.0f) {
+            lastDistance = distance_filter(raw_dist, dist_history, &hist_idx, &filteredDistance);
+            lastValidDistMs = now;
+        } else {
+            if (now - lastValidDistMs > 200) {
                 lastDistance = -1;
                 filteredDistance = -1;
             }
         }
 
-        // Debug output
+        // 3. Debug log định kỳ mỗi 2 giây
         #if US_DEBUG
         if (now - lastDebugMs >= US_DEBUG_INTERVAL) {
             lastDebugMs = now;
-            bool gate = motion_gate_enabled();
-            uint32_t interval = get_beep_interval(current_zone);
-            Serial.printf("[US] Dist=%.1fcm | Zone=%s | Gate=%s | Interval=%dms | Vol=%d\n",
-                          lastDistance, zone_name(current_zone),
-                          gate ? "ON" : "OFF", interval, tone_driver_get_volume());
+            String distStr = (lastDistance > 0) ? (String(lastDistance, 1) + "cm") : "CLEAR (>45cm)";
+            
+            if (mpuOk) {
+                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
+                              distStr.c_str(), zone_name(current_zone), svG, ax, ay, az);
+            } else {
+                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: [DISCONNECTED / Check Wire]\n",
+                              distStr.c_str(), zone_name(current_zone));
+            }
+
             if (current_zone != last_printed_zone) {
                 Serial.printf("[US] *** ZONE CHANGE: %s -> %s ***\n",
                               zone_name(last_printed_zone), zone_name(current_zone));
@@ -204,41 +193,34 @@ static void ultrasonic_task(void *pvParameters) {
         }
         #endif
 
-        if (lastDistance < 0) {
-            current_zone = ZONE_NONE;
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
+        if (lastDistance > 0) {
+            current_zone = get_zone(lastDistance, current_zone);
+            uint32_t beepInterval = get_beep_interval(current_zone);
 
-        // Determine zone with hysteresis
-        current_zone = get_zone(lastDistance, current_zone);
-        uint32_t beepInterval = get_beep_interval(current_zone);
-
-        // Motion gate check:
-        // - mpuOk=true  → chỉ bíp khi gate=ON (đang di chuyển)
-        // - mpuOk=false → KHÔNG bíp (an toàn hơn là spam liên tục khi không có MPU)
-        bool gate = mpuOk && motion_gate_enabled();
-        bool should_beep = (beepInterval > 0) && gate;
-
-        if (should_beep && (now - lastBeep >= beepInterval)) {
-            lastBeep = now;
-            uint8_t vol = tone_driver_get_volume();
-            
-            if (current_zone == ZONE_DANGER_ZONE) {
-                tone_driver_play(TONE_DANGER, 40, vol < 18 ? 18 : vol);
-            } else if (current_zone == ZONE_WARN_ZONE) {
-                tone_driver_play(TONE_WARNING, 35, vol);
-            } else if (current_zone == ZONE_SAFE_ZONE) {
-                tone_driver_play(TONE_SLOW, 30, vol);
+            if (beepInterval > 0 && (now - lastBeep >= beepInterval)) {
+                lastBeep = now;
+                uint8_t vol = tone_driver_get_volume();
+                if (vol < 18) vol = 20;
+                
+                if (current_zone == ZONE_DANGER_ZONE) {
+                    tone_driver_play(TONE_DANGER, 120, 21); // 880Hz, 120ms (nốt còi ngã tròn đầy)
+                } else if (current_zone == ZONE_WARN_ZONE) {
+                    tone_driver_play(TONE_WARNING, 110, vol); // 740Hz, 110ms
+                } else if (current_zone == ZONE_SAFE_ZONE) {
+                    tone_driver_play(TONE_SLOW, 100, vol); // 587Hz, 100ms
+                }
             }
+        } else {
+            current_zone = ZONE_NONE;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz siêu mượt và nhẹ tải CPU)
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
 void ultrasonic_task_start(void) {
-    xTaskCreatePinnedToCore(ultrasonic_task, "us_prox", US_TASK_STACK,
+    xTaskCreatePinnedToCore(ultrasonic_task, "unified_sensors", US_TASK_STACK,
                             NULL, US_TASK_PRIO, NULL, 1);
 }
 

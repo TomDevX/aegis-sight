@@ -29,6 +29,7 @@ static volatile size_t streamReadIdx  = 0;
 static size_t streamCapacity = 0;
 static volatile bool streamActive = false;
 static volatile bool streamBuffering = true;
+static uint32_t lastStreamDataMs = 0;
 
 static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
 
@@ -76,12 +77,10 @@ void tone_driver_set_sample_rate(uint32_t rate) {
 static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
     static int16_t frame[512][2];
     
-    // MAX98357A là amply Class D 3W rất mạnh. Với củ loa mini Seeed Grove (0.5W/8Ω),
-    // tín hiệu Full-Scale (1.0) sẽ làm màng loa bị đập đáy (bottom-out) gây méo tiếng và rè xè.
-    // Dải scale 0.12f .. 0.38f tạo công suất ~0.1W .. 0.4W hoàn hảo: tiếng nói trong trẻo, to rõ, êm dịu, không bao giờ bị rè.
+    // Thang âm lượng 1..21: dải scale 0.40f .. 1.05f cho giọng nói AI cực to rõ và đầy đặn
     float volScale = 0.0f;
     if (currentVolume > 0) {
-        volScale = 0.12f + (float)(currentVolume - 1) * (0.26f / 20.0f);
+        volScale = 0.40f + (float)(currentVolume - 1) * (0.65f / 20.0f);
     }
 
     uint32_t pos = 0;
@@ -146,7 +145,7 @@ static void play_tone_request(const tone_request_t &req) {
     // Reset về sample rate chuẩn khi phát còi/bíp
     tone_driver_set_sample_rate(TONE_SAMPLE_RATE);
 
-    float volScale = (req.volume == 0) ? 0.0f : powf((float)req.volume / 21.0f, 1.5f);
+    float volScale = (req.volume == 0) ? 0.0f : (0.30f + (float)req.volume * (0.70f / 21.0f));
     const int32_t amp = (int32_t)(32000.0f * volScale);
 
     uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * req.durationMs) / 1000;
@@ -156,8 +155,9 @@ static void play_tone_request(const tone_request_t &req) {
     float phase = 0.0f;
     uint32_t generated = 0;
 
-    uint32_t fadeSamples = (TONE_SAMPLE_RATE * 5) / 1000; // 5ms fade chống lụp bụp
-    if (fadeSamples > totalSamples / 4) fadeSamples = totalSamples / 4;
+    // Smooth Raised-Cosine Fade (12ms)
+    uint32_t fadeSamples = (TONE_SAMPLE_RATE * 12) / 1000;
+    if (fadeSamples > totalSamples / 3) fadeSamples = totalSamples / 3;
     if (fadeSamples == 0) fadeSamples = 1;
 
     while (generated < totalSamples) {
@@ -170,17 +170,29 @@ static void play_tone_request(const tone_request_t &req) {
             uint32_t sampleIdx = generated + i;
             float env = 1.0f;
             if (sampleIdx < fadeSamples) {
-                env = (float)sampleIdx / (float)fadeSamples;
+                float f = (float)sampleIdx / (float)fadeSamples;
+                env = 0.5f * (1.0f - cosf(f * (float)M_PI));
             } else if (sampleIdx > totalSamples - fadeSamples) {
-                env = (float)(totalSamples - sampleIdx) / (float)fadeSamples;
+                float f = (float)(totalSamples - sampleIdx) / (float)fadeSamples;
+                env = 0.5f * (1.0f - cosf(f * (float)M_PI));
             }
 
-            toneBuf[i] = (int16_t)(sinf(phase) * env * (float)amp);
+            // Sóng còi ấm áp chuẩn nguyên bản
+            float wave = 0.88f * sinf(phase) + 0.12f * sinf(phase * 2.0f);
+            toneBuf[i] = (int16_t)(wave * env * (float)amp);
+
             phase += phaseInc;
             if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
         }
 
-        i2s_output(toneBuf, n, NULL);
+        // Ghi trực tiếp ra I2S
+        static int16_t frame[512][2];
+        for (uint32_t i = 0; i < n; i++) {
+            frame[i][0] = toneBuf[i];
+            frame[i][1] = toneBuf[i];
+        }
+        size_t written = 0;
+        i2s_write(I2S_SPK_PORT, frame, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
         generated += n;
     }
 }
@@ -205,6 +217,7 @@ static void tone_task(void *pvParameters) {
             }
 
             if (avail > 0) {
+                lastStreamDataMs = millis();
                 size_t chunk = (avail > 512) ? 512 : avail;
                 for (size_t i = 0; i < chunk; i++) {
                     toneBuf[i] = streamBuf[(r + i) % streamCapacity];
@@ -214,6 +227,11 @@ static void tone_task(void *pvParameters) {
                 continue;
             } else {
                 streamBuffering = true;
+                // Nếu buffer rỗng liên tục quá 300ms -> Tự động giải phóng streamActive để nhả loa cho siêu âm và té ngã
+                if (millis() - lastStreamDataMs > 300) {
+                    streamActive = false;
+                    continue;
+                }
                 vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }

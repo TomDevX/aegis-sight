@@ -25,7 +25,7 @@
 
 #define RECORD_TIME_SEC       3
 #define AUDIO_GAIN            2.0f
-#define JPEG_QUALITY          70
+#define JPEG_QUALITY          55
 #define TARGET_GEMINI_MODEL   "gemini-3.5-flash-lite"
 
 // ============================================================================

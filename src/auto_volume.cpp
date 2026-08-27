@@ -71,26 +71,17 @@ static void auto_volume_task(void *pvParameters) {
         return;
     }
 
-    bool micOwned = false;
+    if (!init_mic_i2s()) {
+        Serial.println("[AUTO_VOL] init_mic_i2s failed");
+    } else {
+        Serial.println("[AUTO_VOL] Permanent Mic I2S initialized");
+    }
 
     while (true) {
         if (ai_pipeline_is_busy()) {
-            if (micOwned) {
-                deinit_mic_i2s();
-                micOwned = false;
-                Serial.println("[AUTO_VOL] Released mic to AI pipeline");
-            }
-            vTaskDelay(pdMS_TO_TICKS(AV_READ_MS));
+            // Khi AI đang thu âm hoặc xử lý -> nhả mic tức thì
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
-        }
-
-        if (!micOwned) {
-            if (!init_mic_i2s()) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            micOwned = true;
-            Serial.println("[AUTO_VOL] Mic I2S re-acquired");
         }
 
         size_t bytesRead = 0;

@@ -8,23 +8,18 @@
 // ============================================================
 
 // Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
-// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> capture RGB565 + software
-//       JPEG encode (fmt2jpg) before upload.
-// Core AI Pipeline (Button -> Camera -> Cloud AI -> Speaker)
-// NOTE: RHYX M21-45 (GC2145) has NO JPEG -> capture RGB565 + software
-//       JPEG encode (fmt2jpg) before upload.
-// #define ENABLE_CAMERA_OV2640
-// #define ENABLE_SPEAKER_I2S
+#define ENABLE_CAMERA_OV2640
+#define ENABLE_SPEAKER_I2S
 
 // AI Pipeline (Chặng 3 - HTTP REST + Gemini → text → Google TTS)
-// #define ENABLE_AI_PIPELINE
+#define ENABLE_AI_PIPELINE
 
 // Cloud Text-to-Speech (Google Translate TTS) — HTTP MP3 → decode → play
-// #define ENABLE_TTS_CLOUD
+#define ENABLE_TTS_CLOUD
 
 // Standalone HW Test Modules (Chặng 1)
 // Uncomment 1 module at a time, comment ALL main pipeline flags to avoid conflict
-#define ENABLE_MIC_TEST
+// #define ENABLE_MIC_TEST
 // #define ENABLE_MIC_SPEAKER_TEST   // INMP441 -> Grove Speaker (echo test, PWM)
 // #define ENABLE_SPEAKER_TEST
 // #define ENABLE_ULTRASONIC_TEST
@@ -51,10 +46,10 @@
 // MAIN PIPELINE (Chặng 2) - Real-time tasks on Core 1
 // Enable these together for the full main build
 // ============================================================
-// #define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
-// #define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
-// #define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
-// #define ENABLE_AUTO_VOLUME            // Mic RMS -> auto speaker volume
+#define ENABLE_ULTRASONIC_HC_SR04    // Obstacle proximity beep (motion-gated)
+#define ENABLE_MPU6050_FALL_DETECTION // MPU6050: 3-phase fall detection + SOS
+#define ENABLE_MOTION_GATE            // Motion gate: US beep only while moving
+// #define ENABLE_AUTO_VOLUME         // (Đã loại bỏ hoàn toàn để giải phóng Mic 100% cho AI)
 
 // ============================================================
 // CAMERA - RHYX M21-45 (GC2145, 2MP) - DVP Bus (Right Module - FPC DVP Bus)
@@ -141,7 +136,7 @@
 // ============================================================
 // SYSTEM CONSTANTS
 // ============================================================
-#define SERIAL_BAUD     115200  // 115200 = khớp baud panic-handler để đọc backtrace khi debug
+#define SERIAL_BAUD     2000000  // 2Mbps siêu tốc, giải phóng 95% thời gian in log của CPU
 #define PSRAM_EXPECTED_SIZE (8 * 1024 * 1024)  // 8MB
 
 // ============================================================
@@ -152,24 +147,24 @@
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Beep Thresholds (cm)
-// 4 zones: DANGER (<=25cm) | WARN (25-45cm) | CAUTION (45-60cm) | NONE (>60cm, silent)
-// Giới hạn trong 60cm để tránh spam cảnh báo khi đi trong phòng / hành lang
+// 4 zones: DANGER (<=18cm) | WARN (18-32cm) | SAFE (32-45cm) | NONE (>45cm, silent)
+// Giới hạn trong 45cm để chỉ báo vật cản gần thiết thực, không báo xa
 // ============================================================
-#define ZONE_DANGER          25   // D <= 25cm: FAST beep (nguy hiểm rất gần)
-#define ZONE_WARN            45   // 25-45cm: MED beep (cảnh báo gần)
-#define ZONE_SAFE            60   // 45-60cm: SLOW beep (chú ý)
-#define ZONE_HYSTERESIS      3    // Hysteresis chống chập chờn ranh giới
+#define ZONE_DANGER          18   // D <= 18cm: FAST beep (rất gần)
+#define ZONE_WARN            32   // 18-32cm: MED beep (gần)
+#define ZONE_SAFE            45   // 32-45cm: SLOW beep (chú ý)
+#define ZONE_HYSTERESIS      2    // Hysteresis chống chập chờn ranh giới
 
-// Beep intervals (ms) - smaller = faster beep
-#define INTERVAL_FAST        100   // DANGER zone (bíp dồn dập 100ms)
-#define INTERVAL_MED         250   // WARN zone (bíp vừa 250ms)
-#define INTERVAL_SLOW        500   // SAFE zone (bíp thong thả 500ms)
+// Beep intervals (ms) - khoảng thời gian giữa các hồi chuông
+#define INTERVAL_FAST        180   // DANGER zone (chuông dồn dập 180ms)
+#define INTERVAL_MED         320   // WARN zone (chuông vừa 320ms)
+#define INTERVAL_SLOW        550   // SAFE zone (chuông thong thả 550ms)
 
-// Tone definitions for ultrasonic and fall detection
-#define TONE_ALARM       1800  // SOS alarm frequency
-#define TONE_DANGER      1500  // Danger zone (<=25cm)
-#define TONE_WARNING     1200  // Warning zone (25-45cm)
-#define TONE_SLOW         900  // Slow zone (45-60cm)
+// Tone definitions for ultrasonic and fall detection (Silky Smooth Chimes)
+#define TONE_ALARM       1760  // SOS alarm frequency
+#define TONE_DANGER       880  // A5 (La 5) - 880Hz: DANGER zone (<=18cm, êm ái như còi ngã)
+#define TONE_WARNING      740  // F#5 (Fa# 5) - 740Hz: WARN zone (18-32cm)
+#define TONE_SLOW         587  // D5 (Rê 5) - 587Hz: SAFE zone (32-45cm)
 
 // Distance measurement
 #define US_MEASURE_MS        60    // Fast distance sampling (60ms)
@@ -202,7 +197,7 @@
 #define FALL_IMPACT_WINDOW   300   // ms window for impact after free-fall
 #define FALL_INACTIVITY_MS   2000  // ms of stillness to confirm fall
 #define FALL_CANCEL_WAIT_MS  10000 // ms to wait for user cancel before SOS
-#define FALL_DEBOUNCE_MS     5000  // cooldown after fall alarm (ms)
+#define FALL_DEBOUNCE_MS     1000  // cooldown 1s sau khi tắt còi ngã (sẵn sàng bắt cú ngã tiếp theo ngay)
 
 // ============================================================
 // AUTO-VOLUME RMS THRESHOLDS (16-bit signed PCM)
@@ -213,7 +208,7 @@
 #define AV_RMS_LOUD       8000    // Street noise -> volume 16
 #define AV_RMS_MAX       16000    // Very loud -> volume 21 (max)
 
-// ============================================================
+// ============================================================ 
 // AI PIPELINE (Chặng 3) - HTTP REST + Gemini
 // ============================================================
 // Multi-Wi-Fi - tự động kết nối vào mạng mạnh nhất trong danh sách
@@ -238,7 +233,7 @@
 #define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
 
 // JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
-#define AI_JPEG_QUALITY          60
+#define AI_JPEG_QUALITY          40   // Tối ưu 40: ảnh cực nhẹ (~8KB), nén & upload siêu tốc, AI nhận diện chuẩn xác
 #define AI_JPEG_BUF_SIZE         (128 * 1024)
 
 // Ring buffer for TTS/response audio playback (PSRAM)

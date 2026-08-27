@@ -17,27 +17,38 @@ static unsigned long movingSinceMs = 0;
 static unsigned long stillSinceMs  = 0;
 
 static bool detect_motion(void) {
-    if (windowCount < 5) {
+    if (windowCount < 8) {
         return false;
     }
 
     float sum = 0.0f;
+    uint32_t validCount = 0;
     for (uint32_t i = 0; i < windowCount; i++) {
-        sum += window[i];
+        if (window[i] > 0.20f && window[i] < 5.0f) {
+            sum += window[i];
+            validCount++;
+        }
     }
-    float mean = sum / (float)windowCount;
+    if (validCount < 5) return false;
+
+    float mean = sum / (float)validCount;
 
     float sqDiff = 0.0f;
     for (uint32_t i = 0; i < windowCount; i++) {
-        float d = window[i] - mean;
-        sqDiff += d * d;
+        if (window[i] > 0.20f && window[i] < 5.0f) {
+            float d = window[i] - mean;
+            sqDiff += d * d;
+        }
     }
-    float stddev = sqrtf(sqDiff / (float)windowCount);
+    float stddev = sqrtf(sqDiff / (float)validCount);
 
-    return (stddev > MOTION_STDDEV_G);
+    return (stddev > 0.14f); // 0.14G threshold: khi để yên (stddev ~0.02G) luôn luôn OFF
 }
 
 void motion_gate_update(float svG) {
+    // Bỏ qua giá trị rác nếu có
+    if (svG < 0.20f || svG > 8.0f) return;
+
     window[windowIdx] = svG;
     windowIdx = (windowIdx + 1) % MOTION_WINDOW_SAMPLES;
     if (windowCount < MOTION_WINDOW_SAMPLES) {
