@@ -75,19 +75,19 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 lastStillPrintMs = now;
                 movingSamples = 0;
-                Serial.println("[FALL] >>> Phase 3: Monitoring post-fall stillness (1.5s)...");
+                Serial.println("[FALL] >>> Phase 3: Monitoring post-fall stillness (3.0s)...");
             }
             break;
 
         case FALL_WAITING_STILL: {
             float diffFrom1G = fabsf(a_total - 1.0f);
 
-            // Bất động: a_total nằm trong dải trọng lực tĩnh (0.45G đến 1.55G)
-            if (diffFrom1G > 0.55f) {
+            // Nhạy hơn: Bất động khi |SV - 1.0G| <= 0.35G (0.65G đến 1.35G)
+            // Nếu có cử động hoặc đứng dậy (diffFrom1G > 0.35G trong 4 mẫu = 100ms) -> Hủy ngay báo ngã!
+            if (diffFrom1G > 0.35f) {
                 movingSamples++;
-                // Cử động đi lại, nhấc thiết bị lên (> 12 mẫu = 300ms) -> Hủy báo ngã
-                if (movingSamples > 12) {
-                    Serial.printf("[FALL] Active movement detected (SV=%.2fG) -> Fall Cancelled\n", a_total);
+                if (movingSamples >= 4) {
+                    Serial.printf("[FALL] Active movement detected (SV=%.2fG) -> Fall Cancelled!\n", a_total);
                     fallPhase = FALL_IDLE;
                     movingSamples = 0;
                 }
@@ -96,11 +96,11 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
 
                 if (now - lastStillPrintMs >= 350) {
                     lastStillPrintMs = now;
-                    Serial.printf("[FALL] Stillness: %.1fs / 1.5s (SV=%.2fG)\n", (float)(now - phaseTimer) / 1000.0f, a_total);
+                    Serial.printf("[FALL] Stillness: %.1fs / 3.0s (SV=%.2fG)\n", (float)(now - phaseTimer) / 1000.0f, a_total);
                 }
 
-                // Nằm bất động đủ 1.5 giây sau cú ném / rơi & va chạm -> XÁC NHẬN TÉ NGÃ VÀ HÚ CÒI SOS!
-                if (now - phaseTimer >= 1500) {
+                // Nằm bất động đủ 3.0 giây sau cú rơi & va chạm -> XÁC NHẬN TÉ NGÃ VÀ HÚ CÒI SOS!
+                if (now - phaseTimer >= 3000) {
                     Serial.println("\n[FALL] ========================================");
                     Serial.println("[FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<");
                     Serial.println("[FALL] ========================================\n");
