@@ -5,6 +5,7 @@
 #include "tone_driver.h"
 #include "tts_driver.h"
 #include "secrets.h"
+#include "offline_sounds.h"
 #include <ArduinoJson.h>
 
 #ifdef ENABLE_AI_PIPELINE
@@ -23,46 +24,13 @@ static uint8_t *jpegBuf = NULL;      // JPEG sau khi nén bằng fmt2jpg
 static size_t   jpegSize = 0;
 static int16_t *recordBuf = NULL;    // PCM ghi âm từ mic (Hold-to-Talk)
 static volatile size_t recordSamples = 0;
-static volatile bool dataReady = false;
 static volatile bool pipelineBusy = false;
+static volatile bool dataReady    = false;
 
 #define WAV_HEADER_SIZE       44
 #define RECORD_MIN_MS         300     // tối thiểu 300ms mới coi là có câu hỏi
 
 static bool alloc_buffers(void);
-
-// Forward declarations
-static bool   is_sentence_end(const String &buf, size_t i);
-static String normalize_text(const String &text);
-static void   speak_text(const String &text);
-
-// ============================================================
-// HTTP helpers
-// ============================================================
-static bool http_read_line(WiFiClient &cl, char *buf, size_t sz, int tmoMs) {
-    size_t pos = 0;
-    unsigned long t0 = millis();
-    while (millis() - t0 < (unsigned long)tmoMs) {
-        if (cl.available()) {
-            int c = cl.read();
-            if (c < 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
-            if (c == '\n') { buf[pos] = 0; return true; }
-            if (c != '\r' && pos < sz - 1) buf[pos++] = (char)c;
-            t0 = millis();
-        } else if (!cl.connected()) break;
-        else vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    buf[pos] = 0;
-    return pos > 0 || cl.connected();
-}
-
-static bool http_skip_headers(WiFiClient &cl, int tmoMs) {
-    char buf[256];
-    while (true) {
-        if (!http_read_line(cl, buf, sizeof(buf), tmoMs)) return false;
-        if (buf[0] == 0) return true;
-    }
-}
 
 // ============================================================
 // Text normalization
@@ -103,6 +71,7 @@ static void queue_sentence_for_tts(const String &text) {
     }
 }
 
+// Core 0 task: nhận câu từ queue và phát TTS tuần tự từng câu siêu tốc
 static void tts_worker_task(void *pv) {
     while (true) {
         char *sentence = NULL;
@@ -118,7 +87,7 @@ static void tts_worker_task(void *pv) {
 }
 
 // ============================================================
-// Sentence boundary ('.' bỏ qua giữa 2 chữ số; ngắt ở ',' sau 20 ký tự để phát ngay câu đầu)
+// Sentence boundary: ngắt từng câu một (khi gặp dấu câu đầu tiên) để phát ra loa tức thì
 // ============================================================
 static bool is_sentence_end(const String &buf, size_t i) {
     char c = buf[i];
@@ -128,8 +97,8 @@ static bool is_sentence_end(const String &buf, size_t i) {
         bool n = i + 1 < buf.length() && isdigit(buf[i+1]);
         return !(p && n);
     }
-    // Ngắt sớm ở dấu phẩy/chấm phẩy/gạch ngang nếu cụm từ đã có từ 10 ký tự để phát ra loa tức thì!
-    if ((c == ',' || c == ';' || c == ':' || c == '-') && i >= 10) {
+    // Ngắt sớm ở dấu phẩy/chấm phẩy/gạch ngang nếu cụm từ đã có từ 20 ký tự để phát ra loa tức thì!
+    if ((c == ',' || c == ';' || c == ':' || c == '-') && i >= 20) {
         return true;
     }
     return false;
@@ -138,14 +107,22 @@ static bool is_sentence_end(const String &buf, size_t i) {
 static String ttsSentenceBuf;
 
 static void flush_sentences(void) {
-    int lastBoundary = -1;
-    for (int i = 0; i < (int)ttsSentenceBuf.length(); i++)
-        if (is_sentence_end(ttsSentenceBuf, i)) lastBoundary = i;
-    if (lastBoundary >= 0) {
-        String complete = ttsSentenceBuf.substring(0, lastBoundary + 1);
-        complete.trim();
-        if (complete.length() > 0) queue_sentence_for_tts(complete);
-        ttsSentenceBuf = ttsSentenceBuf.substring(lastBoundary + 1);
+    while (true) {
+        int firstBoundary = -1;
+        for (int i = 0; i < (int)ttsSentenceBuf.length(); i++) {
+            if (is_sentence_end(ttsSentenceBuf, i)) {
+                firstBoundary = i;
+                break;
+            }
+        }
+        if (firstBoundary >= 0) {
+            String complete = ttsSentenceBuf.substring(0, firstBoundary + 1);
+            complete.trim();
+            if (complete.length() > 0) queue_sentence_for_tts(complete);
+            ttsSentenceBuf = ttsSentenceBuf.substring(firstBoundary + 1);
+        } else {
+            break;
+        }
     }
 }
 
@@ -205,12 +182,10 @@ static bool try_ssid(const char *ssid, const char *pass, int tries) {
         vTaskDelay(pdMS_TO_TICKS(250)); c++;
     }
     if (WiFi.status() == WL_CONNECTED) {
-        // Cấu hình Google Public DNS (8.8.8.8) và Cloudflare DNS (1.1.1.1) chống lỗi DNS Failed
-        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8), IPAddress(1, 1, 1, 1));
-        Serial.printf("[WIFI] OK! IP: %s | DNS: 8.8.8.8\n", WiFi.localIP().toString().c_str());
+        Serial.printf("[%6.2fs][WIFI] OK! IP: %s\n", millis() / 1000.0f, WiFi.localIP().toString().c_str());
         return true;
     }
-    Serial.println("[WIFI] Thất bại");
+    Serial.printf("[%6.2fs][WIFI] Thất bại\n", millis() / 1000.0f);
     return false;
 }
 
@@ -496,6 +471,9 @@ static void ai_audio_task(void *pv) {
             if (!pipelineBusy) {
                 if (!alloc_buffers()) continue;
 
+                // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
+                setCpuFrequencyMhz(240);
+
                 tts_driver_stop();
 
                 pipelineBusy = true;
@@ -503,15 +481,11 @@ static void ai_audio_task(void *pv) {
                 jpegSize = 0;
                 recordSamples = 0;
 
-                // Bíp nhẹ 40ms báo hiệu bắt đầu lắng nghe
-                tone_driver_play(1046, 40, 18);
-                vTaskDelay(pdMS_TO_TICKS(50));
+                // Tiếng chuông Captain Speaking máy bay (Cabin PA Ding-Dong) báo hiệu bắt đầu lắng nghe
+                tone_driver_play_captain_chime();
 
                 // 1. Thu âm mic NGAY LẬP TỨC từ mili-giây đầu tiên khi giữ nút
                 recordSamples = record_until_release();
-
-                // Âm thanh báo hiệu ngay khi thả nút: Tít nhẹ 60ms (báo đã nhận lệnh và đang xử lý)
-                tone_driver_play(1320, 60, 18);
 
                 // 2. Chụp ảnh ngay khi vừa thả nút
                 if (!capture_jpeg()) {
@@ -520,9 +494,12 @@ static void ai_audio_task(void *pv) {
                 }
 
                 dataReady = true;
-                Serial.printf("[AI] Đã thu âm %zu samples + ảnh -> Gửi lên Gemini...\n", recordSamples);
+                // Bật nhạc chờ Elevator Music từ PSRAM (Zero-CPU) trong lúc gửi và chờ AI xử lý
+                tone_driver_waiting_music_set(true);
+                Serial.printf("[%6.2fs][AI] Đã thu âm %zu samples + ảnh -> Gửi lên Gemini...\n", millis() / 1000.0f, recordSamples);
             } else {
                 // Bấm trong lúc đang chạy -> hủy
+                tone_driver_waiting_music_set(false);
                 tts_driver_stop();
                 tone_driver_stream_set_active(false);
                 pipelineBusy = false; dataReady = false;
@@ -532,6 +509,7 @@ static void ai_audio_task(void *pv) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+
 // ============================================================
 // Stream dữ liệu lớn lên socket SSL theo chunk 1KB bền bỉ
 // ============================================================
@@ -547,7 +525,7 @@ static bool stream_to_client(WiFiClientSecure &client, const uint8_t *data, size
             vTaskDelay(pdMS_TO_TICKS(25));
             written = client.write(data + offset, chunk);
             if (written == 0) {
-                Serial.printf("[NET] Lỗi ghi socket tại offset %zu/%zu\n", offset, len);
+                Serial.printf("[%6.2fs][NET] Lỗi ghi socket tại offset %zu/%zu\n", millis() / 1000.0f, offset, len);
                 return false;
             }
         }
@@ -562,11 +540,11 @@ static bool stream_to_client(WiFiClientSecure &client, const uint8_t *data, size
 // ============================================================
 static String send_audio_image_to_gemini(void) {
     if (cached_api_key.length() == 0) {
-        Serial.println("[AI] CHƯA CÓ API KEY!");
+        Serial.printf("[%6.2fs][AI] CHƯA CÓ API KEY!\n", millis() / 1000.0f);
         return "";
     }
     if (jpegBuf == NULL || jpegSize == 0) {
-        Serial.println("[AI] Chưa có ảnh để gửi!");
+        Serial.printf("[%6.2fs][AI] Chưa có ảnh để gửi!\n", millis() / 1000.0f);
         return "";
     }
 
@@ -574,19 +552,23 @@ static String send_audio_image_to_gemini(void) {
     client.setInsecure();
     client.setTimeout(25);
 
-    Serial.println("[NET] Đang kết nối tới Gemini API...");
+    // Tắt modem-sleep trong suốt HTTPS session để tránh packet drop gây SSL EOF
+    WiFi.setSleep(false);
+
+    Serial.printf("[%6.2fs][NET] Đang kết nối tới Gemini API...\n", millis() / 1000.0f);
     bool connected = false;
     for (int retry = 0; retry < 3; retry++) {
         if (client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
             connected = true;
             break;
         }
-        Serial.printf("[NET] Đang kết nối lại Gemini API (lần %d/3)...\n", retry + 1);
+        Serial.printf("[%6.2fs][NET] Đang kết nối lại Gemini API (lần %d/3)...\n", millis() / 1000.0f, retry + 1);
         vTaskDelay(pdMS_TO_TICKS(400));
     }
 
     if (!connected) {
-        Serial.println("[NET] Kết nối AI thất bại!");
+        Serial.printf("[%6.2fs][NET] Kết nối AI thất bại!\n", millis() / 1000.0f);
+        WiFi.setSleep(true);
         return "";
     }
 
@@ -603,7 +585,7 @@ static String send_audio_image_to_gemini(void) {
 
     uint8_t *wavBuf = (uint8_t *)ps_malloc(wavSize);
     if (!wavBuf) {
-        Serial.println("[NET] LỖI: Cấp phát PSRAM lưu WAV thất bại!");
+        Serial.printf("[%6.2fs][NET] LỖI: Cấp phát PSRAM lưu WAV thất bại!\n", millis() / 1000.0f);
         client.stop();
         return "";
     }
@@ -615,23 +597,23 @@ static String send_audio_image_to_gemini(void) {
     uint8_t *imgB64 = NULL; size_t imgB64Len = 0;
 
     if (!base64_encode(wavBuf, wavSize, &audB64, &audB64Len)) {
-        Serial.println("[NET] LỖI: Mã hóa Base64 audio thất bại!");
+        Serial.printf("[%6.2fs][NET] LỖI: Mã hóa Base64 audio thất bại!\n", millis() / 1000.0f);
         free(wavBuf); client.stop();
         return "";
     }
     free(wavBuf);
 
     if (!base64_encode(jpegBuf, jpegSize, &imgB64, &imgB64Len)) {
-        Serial.println("[NET] LỖI: Mã hóa Base64 ảnh thất bại!");
+        Serial.printf("[%6.2fs][NET] LỖI: Mã hóa Base64 ảnh thất bại!\n", millis() / 1000.0f);
         free(audB64); client.stop();
         return "";
     }
 
     // 3. Đóng gói JSON: Text chỉ thị trực tiếp (Part 0) -> Audio WAV (Part 1) -> Ảnh JPEG (Part 2)
     String promptText = "Bạn là trợ lý AI thông minh Aegis Sight. "
-                        "File audio đính kèm là prompt (có thể chứa tiếng lóng, tiếng Việt, thuật ngữ)"
+                        "File audio đính kèm là prompt (có thể chứa tiếng lóng, tiếng Việt, thuật ngữ). "
                         "Nhiệm vụ: Hãy lắng nghe audio, hiểu đúng ý câu hỏi của người dùng và TRẢ LỜI NGAY ĐÁP ÁN CHÍNH XÁC bằng tiếng Việt (ngắn gọn dưới 35 từ, không lặp lại câu hỏi). "
-                        "Chỉ mô tả ảnh nếu trong audio không có yêu cầu nào, im lặng hoặc trong prompt audio yêu cầu đọc hình ảnh."
+                        "Chỉ mô tả ảnh nếu trong audio không có yêu cầu nào, im lặng hoặc trong prompt audio yêu cầu đọc hình ảnh. "
                         "Nếu không trả lời được hay không hiểu trong file audio nói gì thì hãy báo là audio không rõ rồi mô tả hình ảnh";
 
     String jsonHeader = "{\"contents\":[{\"parts\":["
@@ -654,8 +636,8 @@ static String send_audio_image_to_gemini(void) {
     client.printf("Connection: close\r\n\r\n");
 
     // 5. Stream JSON body: Header + Audio + Mid + Ảnh + Footer
-    Serial.printf("[NET] Stream Audio(%u) + Ảnh(%u) lên Gemini...\n",
-                  (unsigned)audB64Len, (unsigned)imgB64Len);
+    Serial.printf("[%6.2fs][NET] Stream Audio(%u) + Ảnh(%u) lên Gemini...\n",
+                  millis() / 1000.0f, (unsigned)audB64Len, (unsigned)imgB64Len);
 
     bool streamOk = (client.print(jsonHeader) > 0);
     streamOk = streamOk && stream_to_client(client, audB64, audB64Len);
@@ -669,7 +651,7 @@ static String send_audio_image_to_gemini(void) {
     imgB64 = NULL; audB64 = NULL;
 
     if (!streamOk) {
-        Serial.println("[NET] Lỗi ghi Socket SSL!");
+        Serial.printf("[%6.2fs][NET] Lỗi ghi Socket SSL!\n", millis() / 1000.0f);
         client.stop();
         return "";
     }
@@ -682,7 +664,7 @@ static String send_audio_image_to_gemini(void) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (!client.available()) {
-        Serial.println("[NET] Hết thời gian chờ phản hồi từ AI!");
+        Serial.printf("[%6.2fs][NET] Hết thời gian chờ phản hồi từ AI!\n", millis() / 1000.0f);
         client.stop();
         return "";
     }
@@ -691,18 +673,25 @@ static String send_audio_image_to_gemini(void) {
     String fullReply = "";
     bool inHeader = true;
     startWait = millis();
+    unsigned long lastDataTime = millis();
+    bool hasReceivedAnyText = false;
     int httpStatus = 0;
 
     char lineBuf[512];
 
-    while ((client.connected() || client.available()) && (millis() - startWait < 25000)) {
+    while ((client.connected() || client.available()) && (millis() - startWait < 20000)) {
         if (!pipelineBusy) break;
+
+        // Nếu đã nhận được text và sau 600ms không còn dữ liệu -> kết thúc stream ngay
+        if (hasReceivedAnyText && !client.available() && (millis() - lastDataTime > 600)) {
+            break;
+        }
 
         if (client.available()) {
             size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
             if (n == 0) continue;
             lineBuf[n] = '\0';
-            startWait = millis();
+            lastDataTime = millis();
 
             // Xóa \r ở cuối dòng
             while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
@@ -711,16 +700,16 @@ static String send_audio_image_to_gemini(void) {
 
             if (inHeader) {
                 if (strncmp(lineBuf, "HTTP/1.", 7) == 0) {
-                    Serial.printf("[NET] %s\n", lineBuf);
+                    Serial.printf("[%6.2fs][NET] %s\n", millis() / 1000.0f, lineBuf);
                     if (strstr(lineBuf, " 200 ")) httpStatus = 200;
                     else httpStatus = 400;
                 }
                 if (n == 0) {
                     inHeader = false;
                     if (httpStatus == 200) {
-                        Serial.print("[NET] AI Trả lời: ");
+                        Serial.printf("[%6.2fs][NET] AI Trả lời: ", millis() / 1000.0f);
                     } else {
-                        Serial.println("[NET] Lỗi từ máy chủ Google:");
+                        Serial.printf("[%6.2fs][NET] Lỗi từ máy chủ Google:\n", millis() / 1000.0f);
                     }
                 }
                 continue;
@@ -766,28 +755,35 @@ static String send_audio_image_to_gemini(void) {
                     }
 
                     if (piece.length() > 0) {
+                        hasReceivedAnyText = true;
+                        // Tắt nhạc chờ ngay khi nhận được chữ đầu tiên từ AI!
+                        tone_driver_waiting_music_set(false);
                         Serial.print(piece);
                         fullReply += piece;
                         ttsSentenceBuf += piece;
-                        flush_sentences(); // Bắn ngay sang TTS phát ra loa!
+                        flush_sentences(); // Đẩy ngay câu vào TTS queue
                     }
                 }
+            }
+
+            // Nếu gặp finishReason: STOP -> đã nhận xong câu
+            if (strstr(jsonPayload, "\"finishReason\"")) {
+                break;
             }
         } else {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
 
+    tone_driver_waiting_music_set(false);
     Serial.println();
-    client.stop();
+    client.stop(); // Đóng SSL ngay lập tức giải phóng ~40KB TLS RAM
 
     // Phát nốt phần còn lại của câu cuối cùng
     flush_remaining();
 
     return fullReply;
 }
-
-#include "offline_sounds.h"
 
 // ============================================================
 // Core 0 task chính
@@ -807,22 +803,28 @@ static void ai_net_task(void *pv) {
         }
 
         if (!ensure_wifi()) {
-            Serial.println("[NET] Bỏ lượt hỏi — Wi-Fi không kết nối được");
-            // Phát trực tiếp giọng nói OFFLINE: "Kết nối không thành công"
-            Serial.println("[AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<");
+            Serial.printf("[%6.2fs][NET] Bỏ lượt hỏi — Wi-Fi không kết nối được\n", millis() / 1000.0f);
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
             tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
-            tts_driver_wait_playback_done();
 
             pipelineBusy = false; dataReady = false;
+            wifi_sleep();
+            setCpuFrequencyMhz(80);
             continue;
         }
         if (!creds_loaded) wifi_creds_refresh();
         if (cached_api_key.length() == 0) {
-            Serial.println("[NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!");
+            Serial.printf("[%6.2fs][NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!\n", millis() / 1000.0f);
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
             tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
-            tts_driver_wait_playback_done();
 
             pipelineBusy = false; dataReady = false;
+            wifi_sleep();
+            setCpuFrequencyMhz(80);
             continue;
         }
 
@@ -836,24 +838,24 @@ static void ai_net_task(void *pv) {
                    millis() < tmo && pipelineBusy) {
                 vTaskDelay(pdMS_TO_TICKS(20));
             }
-            vTaskDelay(pdMS_TO_TICKS(150));
-            tone_driver_stream_set_active(false);
-
-            // Tiếng chuông máy bay (Airplane Chime Ding-Dong) báo hiệu hoàn thành trả lời
-            tone_driver_play(784, 160, 19); // Nốt G5 (Ding) 160ms
-            vTaskDelay(pdMS_TO_TICKS(190));
-            tone_driver_play(523, 280, 20); // Nốt C5 (Dong) 280ms ngân vang
-            vTaskDelay(pdMS_TO_TICKS(300));
+            // Tiếng chuông báo hiệu hoàn thành trả lời
+            Serial.printf("[%6.2fs][AI] >>> Hoàn thành câu trả lời! Phát tiếng chuông báo hiệu <<<\n", millis() / 1000.0f);
+            tone_driver_play_captain_chime();
+            vTaskDelay(pdMS_TO_TICKS(350)); // Chờ tiếng chuông ngân vang trọn vẹn 350ms
         } else if (pipelineBusy) {
-            // Khi kết nối thất bại (SSL/DNS/Server Error) -> Phát giọng nói OFFLINE: "Kết nối không thành công"
-            Serial.println("[AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<");
+            // Khi kết nối thất bại (SSL/DNS/Server Error) → phát giọng fail offline
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
             tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
-            tts_driver_wait_playback_done();
         }
 
+        tone_driver_waiting_music_set(false);
         tone_driver_stream_set_active(false);
         pipelineBusy = false;
         dataReady = false;
+        wifi_sleep();
+        setCpuFrequencyMhz(80); // Hạ xung nhịp về 80MHz tiết kiệm pin khi rảnh rỗi
     }
 }
 
@@ -864,9 +866,11 @@ void ai_pipeline_start(void) {}
 void ai_pipeline_stop(void) {
     if (!pipelineBusy) return;
     pipelineBusy = false; dataReady = false;
+    tone_driver_waiting_music_set(false);
     tts_driver_stop();
     tone_driver_stream_set_active(false);
     wifi_sleep();
+    setCpuFrequencyMhz(80);
 }
 
 bool ai_pipeline_is_busy(void) {

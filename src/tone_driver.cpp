@@ -2,17 +2,20 @@
 #include <math.h>
 #include <string.h>
 #include "driver/i2s.h"
+#include "AudioFileSourcePROGMEM.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutput.h"
 
 #define TONE_QUEUE_SIZE    16
 #define TONE_TASK_STACK    8192
 #define TONE_TASK_PRIO     4
 
-// DMA Buffers lớn (12 buffers x 1024 samples) để tránh ngắt quãng khi HTTP tải chậm
-#define SPK_DMA_BUF_COUNT  12
+// DMA Buffers (8 buffers x 1024 samples)
+#define SPK_DMA_BUF_COUNT  8
 #define SPK_DMA_BUF_LEN    1024
 
-// Ngưỡng Pre-buffering: đệm ít nhất ~350ms âm thanh mới bắt đầu đẩy ra loa
-#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 35 / 100)
+// Ngưỡng Pre-buffering: đệm siêu nhanh ~80ms là phát ngay ra loa
+#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 8 / 100)
 
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;
@@ -22,7 +25,7 @@ static volatile uint8_t currentVolume = 21; // Âm lượng cực đại (Max 21
 static QueueHandle_t toneQueue = NULL;
 static uint32_t currentSampleRate = TONE_SAMPLE_RATE;
 
-// --- PSRAM Ring Buffer ---
+// --- PSRAM Ring Buffer (cho AI TTS Voice) ---
 static int16_t *streamBuf = NULL;
 static volatile size_t streamWriteIdx = 0;
 static volatile size_t streamReadIdx  = 0;
@@ -31,7 +34,14 @@ static volatile bool streamActive = false;
 static volatile bool streamBuffering = true;
 static uint32_t lastStreamDataMs = 0;
 
-static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
+// --- PSRAM Pre-decoded Waiting Music (Zero-CPU) ---
+static int16_t *waitingMusicBuf = NULL;
+static size_t waitingMusicTotalSamples = 0;
+static size_t waitingMusicPlayIdx = 0;
+static volatile bool waitingMusicActive = false;
+
+static bool stop_check_stream(void) { return !streamActive; }
+static bool stop_check_waiting(void) { return !waitingMusicActive || streamActive || toneStopFlag; }
 
 static bool spk_install_i2s(void) {
     i2s_config_t i2s_cfg = {
@@ -201,6 +211,7 @@ static void tone_task(void *pvParameters) {
     tone_request_t req;
 
     while (true) {
+        // 1. Ưu tiên số 1: Giọng nói AI từ Google TTS (Stream Ring Buffer)
         if (streamActive) {
             size_t r = streamReadIdx;
             size_t w = streamWriteIdx;
@@ -227,8 +238,7 @@ static void tone_task(void *pvParameters) {
                 continue;
             } else {
                 streamBuffering = true;
-                // Nếu buffer rỗng liên tục quá 300ms -> Tự động giải phóng streamActive để nhả loa cho siêu âm và té ngã
-                if (millis() - lastStreamDataMs > 300) {
+                if (lastStreamDataMs > 0 && millis() - lastStreamDataMs > 1000) {
                     streamActive = false;
                     continue;
                 }
@@ -237,7 +247,25 @@ static void tone_task(void *pvParameters) {
             }
         }
 
-        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(50)) == pdTRUE) {
+        // 2. Nhạc chờ Elevator Music từ PSRAM (khi đang chờ AI phản hồi và chưa có text)
+        if (waitingMusicActive && waitingMusicBuf && waitingMusicTotalSamples > 0) {
+            static int16_t waitChunk[256];
+            size_t chunk = 256;
+            for (size_t i = 0; i < chunk; i++) {
+                int32_t s = (int32_t)((float)waitingMusicBuf[waitingMusicPlayIdx] * 0.60f);
+                waitChunk[i] = (int16_t)s;
+                waitingMusicPlayIdx++;
+                if (waitingMusicPlayIdx >= waitingMusicTotalSamples) {
+                    waitingMusicPlayIdx = 0;
+                }
+            }
+            // Phát trực tiếp ra I2S với callback ngắt tức thì nếu có streamActive hoặc tắt waitingMusic
+            i2s_output(waitChunk, chunk, stop_check_waiting);
+            continue;
+        }
+
+        // 3. Chuông, còi bíp, còi SOS từ hàng đợi toneQueue
+        if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(20)) == pdTRUE) {
             tonePlaying = true;
             toneStopFlag = false;
             play_tone_request(req);
@@ -281,7 +309,8 @@ void tone_driver_stream_init(void) {
 }
 
 bool tone_driver_stream_write(const int16_t *data, size_t samples) {
-    if (!streamBuf || !streamActive) return false;
+    if (!streamBuf) return false;
+    streamActive = true;
 
     size_t r = streamReadIdx;
     size_t w = streamWriteIdx;
@@ -292,12 +321,14 @@ bool tone_driver_stream_write(const int16_t *data, size_t samples) {
         streamBuf[(w + i) % streamCapacity] = data[i];
     }
     streamWriteIdx = (w + samples) % streamCapacity;
+    lastStreamDataMs = millis();
     return true;
 }
 
 void tone_driver_stream_set_active(bool active) {
     streamActive = active;
     streamBuffering = true;
+    lastStreamDataMs = millis();
     if (!active) {
         streamWriteIdx = 0;
         streamReadIdx  = 0;
@@ -311,4 +342,159 @@ size_t tone_driver_stream_available(void) {
     size_t r = streamReadIdx;
     size_t w = streamWriteIdx;
     return (w - r + streamCapacity) % streamCapacity;
+}
+
+// ============================================================
+// Sound Effects & Realistic Airplane Chimes (Exponential Decay)
+// ============================================================
+
+// Hàm tổng hợp tiếng chuông ngân vang tắt dần tự nhiên (Acoustic Bell Synthesizer)
+static void play_bell_tone(float freqHz, uint32_t durationMs, float decaySpeed, uint8_t vol) {
+    if (vol > 21) vol = 21;
+    if (vol == 0) return;
+
+    int32_t amp = 3000 + (int32_t)(vol - 1) * (26000 / 20);
+    uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * durationMs) / 1000;
+    if (totalSamples == 0) return;
+
+    float phaseInc = (2.0f * (float)M_PI * freqHz) / (float)TONE_SAMPLE_RATE;
+    float phase = 0.0f;
+    uint32_t generated = 0;
+
+    static int16_t frame[512][2];
+
+    while (generated < totalSamples) {
+        if (toneStopFlag) break;
+
+        uint32_t n = totalSamples - generated;
+        if (n > 512) n = 512;
+
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t sampleIdx = generated + i;
+            float tSec = (float)sampleIdx / (float)TONE_SAMPLE_RATE;
+
+            // Đường bao tắt dần mượt mà tự nhiên (Exponential Decay)
+            float env = expf(-tSec * decaySpeed);
+            if (sampleIdx < 80) { // Fade-in 3ms chống tiếng click
+                env *= (float)sampleIdx / 80.0f;
+            }
+
+            // Hài âm chuông ấm (Fundamental + Overtones)
+            float wave = 0.82f * sinf(phase) + 0.15f * sinf(phase * 2.0f) + 0.03f * sinf(phase * 3.0f);
+            int32_t s = (int32_t)(wave * env * (float)amp);
+            if (s > 30000) s = 30000;
+            else if (s < -30000) s = -30000;
+
+            frame[i][0] = (int16_t)s;
+            frame[i][1] = (int16_t)s;
+
+            phase += phaseInc;
+            if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+        }
+
+        size_t written = 0;
+        i2s_write(I2S_SPK_PORT, frame, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+        generated += n;
+    }
+}
+
+// 1. Hiệu ứng âm thanh khởi động thiết bị (Startup Resonant Arpeggio Chime)
+void tone_driver_play_startup(void) {
+    toneStopFlag = false;
+    streamActive = false;
+    play_bell_tone(523, 130, 4.5f, 20); // C5
+    vTaskDelay(pdMS_TO_TICKS(110));
+    play_bell_tone(659, 130, 4.5f, 20); // E5
+    vTaskDelay(pdMS_TO_TICKS(110));
+    play_bell_tone(784, 150, 4.0f, 20); // G5
+    vTaskDelay(pdMS_TO_TICKS(130));
+    play_bell_tone(1046, 550, 2.5f, 21); // C6 (ngân dài thanh thoát)
+    vTaskDelay(pdMS_TO_TICKS(580));
+}
+
+// 2. Tiếng chuông Captain Speaking trên máy bay (Cabin PA Chime: Ding-Dong nhanh gọn, sang trọng ~230ms)
+void tone_driver_play_captain_chime(void) {
+    toneStopFlag = false;
+    streamActive = false;
+    // Nốt "Ding" (E5 - 659Hz) nhanh thanh thoát 90ms
+    play_bell_tone(659.25f, 90, 7.5f, 21);
+    vTaskDelay(pdMS_TO_TICKS(15));
+    // Nốt "Dong" (A4 - 440Hz) trầm ấm 130ms
+    play_bell_tone(440.00f, 130, 6.5f, 21);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+// 3. Tiếng âm báo ngắt mic khi nhả nút (Warm Soft Two-Tone Chime: êm dịu, dứt khoát ~190ms)
+void tone_driver_play_release_chime(void) {
+    toneStopFlag = false;
+    streamActive = false;
+    play_bell_tone(587.33f, 80, 8.0f, 19); // Nốt D5 êm nhẹ 80ms
+    vTaskDelay(pdMS_TO_TICKS(10));
+    play_bell_tone(440.00f, 110, 7.0f, 19); // Nốt A4 trầm ấm 110ms
+    vTaskDelay(pdMS_TO_TICKS(15));
+}
+
+// ============================================================
+// Zero-CPU Pre-decoded PSRAM Waiting Music
+// ============================================================
+class AudioOutputToPcmBuffer : public AudioOutput {
+private:
+    int16_t *targetBuf;
+    size_t maxSamples;
+    size_t currentSamples;
+public:
+    AudioOutputToPcmBuffer(int16_t *buf, size_t maxS) : targetBuf(buf), maxSamples(maxS), currentSamples(0) {}
+    virtual bool begin() override { currentSamples = 0; return true; }
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+        if (currentSamples >= maxSamples) return false;
+        int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
+        targetBuf[currentSamples++] = (int16_t)mixed;
+        return true;
+    }
+    virtual bool stop() override { return true; }
+    size_t getSamples() const { return currentSamples; }
+};
+
+void tone_driver_predecode_waiting_music(const uint8_t *mp3Data, size_t mp3Len) {
+    if (!mp3Data || mp3Len == 0) return;
+
+    // Cấp phát 12 giây ở sample rate hiện tại (288,000 samples = 576KB PSRAM)
+    size_t maxSamples = (size_t)currentSampleRate * 12;
+    waitingMusicBuf = (int16_t *)ps_malloc(maxSamples * sizeof(int16_t));
+    if (!waitingMusicBuf) {
+        Serial.println("[TONE] Cấp phát PSRAM lưu nhạc chờ thất bại!");
+        return;
+    }
+
+    AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(mp3Data, mp3Len);
+    AudioOutputToPcmBuffer *out = new AudioOutputToPcmBuffer(waitingMusicBuf, maxSamples);
+    AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+
+    out->begin();
+    if (mp3->begin(file, out)) {
+        while (mp3->isRunning() && out->getSamples() < maxSamples) {
+            if (!mp3->loop()) break;
+        }
+    }
+    waitingMusicTotalSamples = out->getSamples();
+
+    out->stop();
+    delete mp3;
+    delete file;
+    delete out;
+
+    Serial.printf("[INIT] Pre-decoded %.1fs Elevator Music vào PSRAM (%zu samples)\n",
+                  (float)waitingMusicTotalSamples / (float)currentSampleRate, waitingMusicTotalSamples);
+}
+
+void tone_driver_waiting_music_set(bool active) {
+    if (active) {
+        toneStopFlag = false;
+        waitingMusicPlayIdx = 0;
+    }
+    waitingMusicActive = active;
+}
+
+bool tone_driver_waiting_music_is_active(void) {
+    return waitingMusicActive;
 }

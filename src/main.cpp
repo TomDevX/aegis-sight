@@ -15,6 +15,7 @@
 #include "ai_pipeline.h"
 #include "secrets.h"
 #include "config_portal.h"
+#include "offline_sounds.h"
 
 // ============================================================
 // GLOBAL STATE
@@ -100,6 +101,7 @@ void setup() {
     if (tone_driver_init()) {
         tone_driver_start_task();
         tone_driver_stream_init();
+        tone_driver_predecode_waiting_music(OFFLINE_ELEVATOR_MUSIC, OFFLINE_ELEVATOR_MUSIC_LEN);
         Serial.println("[INIT] I2S Speaker tone driver ready");
     } else {
         Serial.println("[ERROR] Tone driver init failed!");
@@ -141,6 +143,13 @@ void setup() {
     Serial.println("  Core 0: Wi-Fi + HTTP REST + Gemini");
     Serial.println("  Core 1: US + Fall + AutoVol + AI Rec + Speaker");
     Serial.println("========================================");
+
+    // Hiệu ứng âm thanh khởi động thiết bị sẵn sàng
+    tone_driver_play_startup();
+
+    // Chuyển sang xung nhịp tiết kiệm điện 80MHz khi ở chế độ chờ (Eco Standby)
+    setCpuFrequencyMhz(80);
+    Serial.println("[POWER] CPU Scaled to 80MHz Eco Standby Mode");
 }
 
 // ============================================================

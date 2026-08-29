@@ -178,16 +178,16 @@ static void ultrasonic_task(void *pvParameters) {
             String distStr = (lastDistance > 0) ? (String(lastDistance, 1) + "cm") : "CLEAR (>45cm)";
             
             if (mpuOk) {
-                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
-                              distStr.c_str(), zone_name(current_zone), svG, ax, ay, az);
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone), svG, ax, ay, az);
             } else {
-                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: [DISCONNECTED / Check Wire]\n",
-                              distStr.c_str(), zone_name(current_zone));
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | MPU: [DISCONNECTED / Check Wire]\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone));
             }
 
             if (current_zone != last_printed_zone) {
-                Serial.printf("[US] *** ZONE CHANGE: %s -> %s ***\n",
-                              zone_name(last_printed_zone), zone_name(current_zone));
+                Serial.printf("[%6.2fs][US] *** ZONE CHANGE: %s -> %s ***\n",
+                              now / 1000.0f, zone_name(last_printed_zone), zone_name(current_zone));
                 last_printed_zone = current_zone;
             }
         }

@@ -25,7 +25,8 @@ static uint8_t freeFallSamples = 0;
 static uint8_t movingSamples = 0;
 
 static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
-    if (ai_pipeline_is_busy() || (millis() - cancelCooldown < FALL_DEBOUNCE_MS)) {
+    // Không bao giờ chặn fall detection khi AI đang chạy — té ngã vẫn phải phát hiện được
+    if (millis() - cancelCooldown < FALL_DEBOUNCE_MS) {
         fallPhase = FALL_IDLE;
         freeFallSamples = 0;
         movingSamples = 0;
@@ -42,7 +43,7 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 freeFallSamples = 0;
                 movingSamples = 0;
-                Serial.printf("\n[FALL] >>> Phase 1: Free Fall DETECTED (SV=%.2fG) <<<\n", a_total);
+                Serial.printf("\n[%6.2fs][FALL] >>> Phase 1: Free Fall DETECTED (SV=%.2fG) <<<\n", now / 1000.0f, a_total);
             }
             // 2. Nhánh 2: Ném mạnh xuống / Quật ngã / Va đập chấn động dứt khoát (a_total > 2.20G)
             else if (a_total > 2.20f) {
@@ -50,7 +51,7 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 freeFallSamples = 0;
                 movingSamples = 0;
-                Serial.printf("\n[FALL] >>> Direct Throw / High-G Impact DETECTED (SV=%.2fG) <<<\n", a_total);
+                Serial.printf("\n[%6.2fs][FALL] >>> Direct Throw / High-G Impact DETECTED (SV=%.2fG) <<<\n", now / 1000.0f, a_total);
             }
             break;
 
@@ -61,7 +62,7 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 freeFallSamples = 0;
                 movingSamples = 0;
-                Serial.printf("[FALL] >>> Phase 2: Landing Impact DETECTED (SV=%.2fG) <<<\n", a_total);
+                Serial.printf("[%6.2fs][FALL] >>> Phase 2: Landing Impact DETECTED (SV=%.2fG) <<<\n", now / 1000.0f, a_total);
             } else if (now - phaseTimer > 1000) { 
                 fallPhase = FALL_IDLE;
                 freeFallSamples = 0;
@@ -75,7 +76,7 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 lastStillPrintMs = now;
                 movingSamples = 0;
-                Serial.println("[FALL] >>> Phase 3: Monitoring post-fall stillness (3.0s)...");
+                Serial.printf("[%6.2fs][FALL] >>> Phase 3: Monitoring post-fall stillness (3.0s)...\n", now / 1000.0f);
             }
             break;
 
@@ -87,7 +88,7 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
             if (diffFrom1G > 0.35f) {
                 movingSamples++;
                 if (movingSamples >= 4) {
-                    Serial.printf("[FALL] Active movement detected (SV=%.2fG) -> Fall Cancelled!\n", a_total);
+                    Serial.printf("[%6.2fs][FALL] Active movement detected (SV=%.2fG) -> Fall Cancelled!\n", now / 1000.0f, a_total);
                     fallPhase = FALL_IDLE;
                     movingSamples = 0;
                 }
@@ -96,14 +97,17 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
 
                 if (now - lastStillPrintMs >= 350) {
                     lastStillPrintMs = now;
-                    Serial.printf("[FALL] Stillness: %.1fs / 3.0s (SV=%.2fG)\n", (float)(now - phaseTimer) / 1000.0f, a_total);
+                    Serial.printf("[%6.2fs][FALL] Stillness: %.1fs / 3.0s (SV=%.2fG)\n", now / 1000.0f, (float)(now - phaseTimer) / 1000.0f, a_total);
                 }
 
                 // Nằm bất động đủ 3.0 giây sau cú rơi & va chạm -> XÁC NHẬN TÉ NGÃ VÀ HÚ CÒI SOS!
                 if (now - phaseTimer >= 3000) {
                     Serial.println("\n[FALL] ========================================");
-                    Serial.println("[FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<");
+                    Serial.printf("[%6.2fs][FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<\n", now / 1000.0f);
                     Serial.println("[FALL] ========================================\n");
+                    // Dừng mọi luồng AI/TTS ngay lập tức
+                    ai_pipeline_stop();
+                    tone_driver_stream_set_active(false);
                     alarmActive = true;
                     lastSosAlarmBeepMs = 0;
                     fallPhase = FALL_IDLE;

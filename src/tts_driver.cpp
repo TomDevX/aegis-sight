@@ -4,6 +4,7 @@
 #ifdef ENABLE_TTS_CLOUD
 
 #include <WiFi.h>
+#include "offline_sounds.h"
 #include "AudioFileSourcePROGMEM.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutput.h"
@@ -47,6 +48,7 @@ public:
 
     virtual bool begin() override {
         chunkIdx = 0;
+        ttsCancel = false;
         tone_driver_stream_set_active(true);
         return true;
     }
@@ -70,14 +72,13 @@ public:
         // Gộp stereo thành mono chuẩn
         int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
 
-        // Khuếch đại mạnh mẽ 2.8x cho âm lượng cực kỳ to vang, rõ từng từ
+        // Giọng nói AI: khuếch đại to rõ 2.8x với soft-limiting chống vỡ tiếng
         float x = (float)mixed * 2.8f;
         if (x > 26000.0f) {
             x = 26000.0f + (x - 26000.0f) * 0.25f;
         } else if (x < -26000.0f) {
             x = -26000.0f + (x + 26000.0f) * 0.25f;
         }
-
         if (x > 32000.0f) x = 32000.0f;
         else if (x < -32000.0f) x = -32000.0f;
 
@@ -105,8 +106,8 @@ public:
                 }
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
-            chunkIdx = 0;
         }
+        chunkIdx = 0;
         return true;
     }
 };
@@ -127,7 +128,7 @@ void tts_driver_speak(const char *text, size_t len) {
 
     String enc = url_encode_str(String(text));
 
-    Serial.printf("[TTS] Đang tải & phát: \"%.40s...\"\n", text);
+    Serial.printf("[%6.2fs][TTS] Đang tải & phát: \"%.40s...\"\n", millis() / 1000.0f, text);
 
     size_t mp3Len = 0;
 
@@ -198,7 +199,7 @@ void tts_driver_speak(const char *text, size_t len) {
         return;
     }
 
-    Serial.printf("[TTS] Tải xong %zu bytes MP3. Bắt đầu giải mã...\n", mp3Len);
+    Serial.printf("[%6.2fs][TTS] Tải xong %zu bytes MP3. Bắt đầu giải mã...\n", millis() / 1000.0f, mp3Len);
 
     // 3. Giải mã siêu tốc từ RAM bằng AudioFileSourcePROGMEM
     AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(mp3Buf, mp3Len);
@@ -220,7 +221,7 @@ void tts_driver_speak(const char *text, size_t len) {
             }
         }
     } else {
-        Serial.println("[TTS] mp3->begin thất bại!");
+        Serial.printf("[%6.2fs][TTS] mp3->begin thất bại!\n", millis() / 1000.0f);
     }
 
     out->stop();
@@ -253,7 +254,7 @@ void tts_driver_play_progmem(const uint8_t *data, size_t len) {
             if ((loopCount & 0x07) == 0) taskYIELD();
         }
     } else {
-        Serial.println("[TTS] mp3->begin PROGMEM thất bại!");
+        Serial.printf("[%6.2fs][TTS] mp3->begin PROGMEM thất bại!\n", millis() / 1000.0f);
     }
 
     out->stop();
