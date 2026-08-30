@@ -235,10 +235,10 @@
 #define GROQ_VISION_MODEL_A     "qwen/qwen3.8-27b"
 #define GROQ_VISION_MODEL_B     "qwen/qwen3.6-27b"
 
-// Hold-to-Talk: bấm giữ để ghi âm, thả để gửi. Tối đa 8 giây.
+// Hold-to-Talk: bấm giữ để ghi âm, thả để gửi (Thoải mái nói chuyện, tối đa 60 giây).
 #define AI_AUDIO_SAMPLE_RATE    16000
-#define AI_AUDIO_MAX_RECORD_MS  8000
-#define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
+#define AI_AUDIO_MAX_RECORD_MS  60000
+#define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 960000 samples (1.92MB trong PSRAM)
 #define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
 
 // JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
