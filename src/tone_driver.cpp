@@ -247,8 +247,17 @@ static void tone_task(void *pvParameters) {
             }
         }
 
-        // 2. Nhạc chờ Elevator Music từ PSRAM (khi đang chờ AI phản hồi và chưa có text)
+        // 2. Nhạc chờ Elevator Music từ PSRAM (khi đang chờ AI phản hồi)
         if (waitingMusicActive && waitingMusicBuf && waitingMusicTotalSamples > 0) {
+            // Kiểm tra nếu có cảnh báo siêu âm hoặc SOS trong toneQueue -> phát ưu tiên ngay lập tức không để dồn queue!
+            if (xQueueReceive(toneQueue, &req, 0) == pdTRUE) {
+                tonePlaying = true;
+                toneStopFlag = false;
+                play_tone_request(req);
+                tonePlaying = false;
+                continue;
+            }
+
             static int16_t waitChunk[256];
             size_t chunk = 256;
             for (size_t i = 0; i < chunk; i++) {
@@ -264,7 +273,7 @@ static void tone_task(void *pvParameters) {
             continue;
         }
 
-        // 3. Chuông, còi bíp, còi SOS từ hàng đợi toneQueue
+        // 3. Chuông, còi bíp, còi SOS từ hàng đợi toneQueue khi không có nhạc chờ
         if (xQueueReceive(toneQueue, &req, pdMS_TO_TICKS(20)) == pdTRUE) {
             tonePlaying = true;
             toneStopFlag = false;

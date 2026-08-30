@@ -146,10 +146,8 @@ void setup() {
 
     // Hiệu ứng âm thanh khởi động thiết bị sẵn sàng
     tone_driver_play_startup();
-
-    // Chuyển sang xung nhịp tiết kiệm điện 80MHz khi ở chế độ chờ (Eco Standby)
-    setCpuFrequencyMhz(80);
-    Serial.println("[POWER] CPU Scaled to 80MHz Eco Standby Mode");
+    setCpuFrequencyMhz(240);
+    Serial.println("[POWER] CPU Running at Full Speed 240MHz");
 }
 
 // ============================================================
@@ -195,10 +193,14 @@ static void checkPSRAM(void) {
     Serial.println("[INFO] PSRAM free: " + String(ESP.getFreePsram() / 1024) + " KB");
 }
 
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
 // ============================================================
 // SERIAL INIT
 // ============================================================
 static void initSerial(void) {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Vô hiệu hóa ngắt sụt áp tạm thời để tránh reset lặp vòng
     Serial.begin(SERIAL_BAUD);
     delay(100);
     Serial.println("\n\n========================================");
@@ -253,8 +255,8 @@ static bool initCamera(void) {
     config.pin_pwdn     = CAM_PWDN;
     config.pin_reset    = CAM_RESET;
 
-    // GC2145: PIXFORMAT_JPEG luôn fail 0x106 -> dùng RGB565 QVGA
-    config.xclk_freq_hz = 15000000;
+    // GC2145: Dùng XCLK 12MHz mượt mà, không overflow DMA
+    config.xclk_freq_hz = 12000000;
     config.pixel_format = PIXFORMAT_RGB565;
     config.frame_size   = FRAMESIZE_QVGA;   // 320x240
     config.fb_count     = 2;

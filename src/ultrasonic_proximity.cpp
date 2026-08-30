@@ -151,9 +151,10 @@ static void ultrasonic_task(void *pvParameters) {
 
         // 1. Bước 1: Đọc MPU6050 (Lúc này chân Trig siêu âm hoàn toàn im lặng, I2C đọc mượt 100%)
         float ax = 0, ay = 0, az = 0, svG = 1.0f;
-        bool mpuOk = mpu_manager_read_accel_g(&ax, &ay, &az, &svG);
+        float gx = 0, gy = 0, gz = 0, gyroDegS = 0.0f;
+        bool mpuOk = mpu_manager_read_motion(&ax, &ay, &az, &svG, &gx, &gy, &gz, &gyroDegS);
         if (mpuOk) {
-            fall_detection_process_sample(ax, ay, az, svG);
+            fall_detection_process_sample(ax, ay, az, svG, gyroDegS);
         }
 
         // Duy trì còi hú cứu hộ SOS nếu đang có cảnh báo ngã
@@ -197,7 +198,8 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = get_zone(lastDistance, current_zone);
             uint32_t beepInterval = get_beep_interval(current_zone);
 
-            if (beepInterval > 0 && (now - lastBeep >= beepInterval)) {
+            // Khi AI đang chạy (ghi âm, chờ AI, phát TTS): Tạm ngắt (MUTE) tiếng bíp để nhường 100% âm thanh cho AI!
+            if (!ai_pipeline_is_busy() && beepInterval > 0 && (now - lastBeep >= beepInterval)) {
                 lastBeep = now;
                 uint8_t vol = tone_driver_get_volume();
                 if (vol < 18) vol = 20;
@@ -214,8 +216,12 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = ZONE_NONE;
         }
 
-        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz siêu mượt và nhẹ tải CPU)
-        vTaskDelay(pdMS_TO_TICKS(25));
+        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz). Khi đang hỏi AI, giãn cách 80ms để nhường bus cho HTTPS SSL
+        if (ai_pipeline_is_busy()) {
+            vTaskDelay(pdMS_TO_TICKS(80));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
     }
 }
 

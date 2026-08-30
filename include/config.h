@@ -220,11 +220,20 @@
 #define WIFI_SSID3              ""
 #define WIFI_PASS3              ""
 #define GEMINI_API_KEY          "" 
-#define GEMINI_MODEL            "models/gemini-3.5-flash-lite"
-#define GEMINI_MODEL_SHORT      "gemini-3.5-flash-lite"
+#define GEMINI_MODEL_PRIMARY    "gemini-3.5-flash-lite"
+#define GEMINI_MODEL_FALLBACK   "gemini-3.1-flash-lite"
+#define GEMINI_MODEL_SHORT      GEMINI_MODEL_PRIMARY
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
 #define GEMINI_API_PORT         443
 #define GEMINI_UPLOAD_HOST      "storage.googleapis.com"
+
+// Groq Whisper LPU Speech-to-Text & Qwen Vision LLM (~250ms)
+#define GROQ_API_KEY            ""
+#define GROQ_API_HOST           "api.groq.com"
+#define GROQ_API_PORT           443
+#define GROQ_MODEL              "whisper-large-v3-turbo"
+#define GROQ_VISION_MODEL_A     "qwen/qwen3.8-27b"
+#define GROQ_VISION_MODEL_B     "qwen/qwen3.6-27b"
 
 // Hold-to-Talk: bấm giữ để ghi âm, thả để gửi. Tối đa 8 giây.
 #define AI_AUDIO_SAMPLE_RATE    16000
@@ -233,10 +242,10 @@
 #define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
 
 // JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
-#define AI_JPEG_QUALITY          40   // Tối ưu 40: ảnh cực nhẹ (~8KB), nén & upload siêu tốc, AI nhận diện chuẩn xác
+#define AI_JPEG_QUALITY          30   // Tối ưu 30: ảnh siêu nhẹ (~4KB), nén & upload 30ms, Google Vision xử lý tức thì
 #define AI_JPEG_BUF_SIZE         (128 * 1024)
 
-// Ring buffer for TTS/response audio playback (PSRAM)
+// Ring buffer for TTS/response audio playback (PSRAM)  
 // Larger buffer (256KB) to accommodate local TTS PCM generation
 #define AI_PCM_RINGBUF_SIZE     (256 * 1024)
 
