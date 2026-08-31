@@ -9,8 +9,8 @@
 // Detection: stddev of SV (accel vector magnitude in g) over a
 // sliding window; hysteresis timers prevent gate flicker.
 
-// Feed one SV sample (in g) per call, e.g. every 20ms from the MPU task.
-void    motion_gate_update(float svG);
+// Feed SV sample (in g) and optional gyro rate (in deg/s) per call
+void    motion_gate_update(float svG, float gyroDegS = 0.0f);
 // Current gate state: true = user is moving (US beeps allowed).
 bool    motion_gate_enabled(void);
 // Reset buffers + state (e.g. on task start).

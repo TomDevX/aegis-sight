@@ -154,6 +154,7 @@ static void ultrasonic_task(void *pvParameters) {
         float gx = 0, gy = 0, gz = 0, gyroDegS = 0.0f;
         bool mpuOk = mpu_manager_read_motion(&ax, &ay, &az, &svG, &gx, &gy, &gz, &gyroDegS);
         if (mpuOk) {
+            motion_gate_update(svG, gyroDegS);
             fall_detection_process_sample(ax, ay, az, svG, gyroDegS);
         }
 
@@ -172,6 +173,8 @@ static void ultrasonic_task(void *pvParameters) {
             }
         }
 
+        bool isMoving = motion_gate_enabled();
+
         // 3. Debug log định kỳ mỗi 2 giây
         #if US_DEBUG
         if (now - lastDebugMs >= US_DEBUG_INTERVAL) {
@@ -179,11 +182,13 @@ static void ultrasonic_task(void *pvParameters) {
             String distStr = (lastDistance > 0) ? (String(lastDistance, 1) + "cm") : "CLEAR (>45cm)";
             
             if (mpuOk) {
-                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
-                              now / 1000.0f, distStr.c_str(), zone_name(current_zone), svG, ax, ay, az);
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | Motion=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone),
+                              isMoving ? "MOVING" : "STILL", svG, ax, ay, az);
             } else {
-                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | MPU: [DISCONNECTED / Check Wire]\n",
-                              now / 1000.0f, distStr.c_str(), zone_name(current_zone));
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | Motion=%s | MPU: [DISCONNECTED / Check Wire]\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone),
+                              isMoving ? "MOVING" : "STILL");
             }
 
             if (current_zone != last_printed_zone) {
@@ -198,8 +203,10 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = get_zone(lastDistance, current_zone);
             uint32_t beepInterval = get_beep_interval(current_zone);
 
-            // Khi AI đang chạy (ghi âm, chờ AI, phát TTS): Tạm ngắt (MUTE) tiếng bíp để nhường 100% âm thanh cho AI!
-            if (!ai_pipeline_is_busy() && beepInterval > 0 && (now - lastBeep >= beepInterval)) {
+            // CHỈ PHÁT TIẾNG BÍP KHI:
+            // 1. Không bận AI (!ai_pipeline_is_busy())
+            // 2. Người dùng ĐANG DI CHUYỂN / BƯỚC ĐI (motion_gate_enabled()) -> Khi đứng yên/ngồi yên sẽ im lặng 100%!
+            if (!ai_pipeline_is_busy() && isMoving && beepInterval > 0 && (now - lastBeep >= beepInterval)) {
                 lastBeep = now;
                 uint8_t vol = tone_driver_get_volume();
                 if (vol < 18) vol = 20;

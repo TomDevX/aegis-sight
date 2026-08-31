@@ -15,6 +15,7 @@ static uint32_t windowIdx   = 0;
 static bool          gateEnabled   = false;
 static unsigned long movingSinceMs = 0;
 static unsigned long stillSinceMs  = 0;
+static float         lastGyroDegS  = 0.0f;
 
 static bool detect_motion(void) {
     if (windowCount < 8) {
@@ -29,7 +30,7 @@ static bool detect_motion(void) {
             validCount++;
         }
     }
-    if (validCount < 5) return false;
+    if (validCount < 6) return false;
 
     float mean = sum / (float)validCount;
 
@@ -42,10 +43,15 @@ static bool detect_motion(void) {
     }
     float stddev = sqrtf(sqDiff / (float)validCount);
 
-    return (stddev > 0.14f); // 0.14G threshold: khi để yên (stddev ~0.02G) luôn luôn OFF
+    // CHỈ TÍNH BƯỚC ĐI (LOCOMOTION):
+    // - Khi đứng yên (kể cả quay đầu / nhìn quanh): stddev chỉ ~0.02G -> KHÔNG tính là di chuyển
+    // - Khi bước đi: xung lực tiếp đất của bước chân làm dao động stddev >= 0.09G -> KÍCH HOẠT CẢNH BÁO
+    return (stddev >= 0.09f);
 }
 
-void motion_gate_update(float svG) {
+void motion_gate_update(float svG, float gyroDegS) {
+    lastGyroDegS = gyroDegS;
+
     // Bỏ qua giá trị rác nếu có
     if (svG < 0.20f || svG > 8.0f) return;
 
