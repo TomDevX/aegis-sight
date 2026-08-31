@@ -226,6 +226,7 @@
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
 #define GEMINI_API_PORT         443
 #define GEMINI_UPLOAD_HOST      "storage.googleapis.com"
+#define GEMINI_SESSION_TIMEOUT_MS 45000  // [ĐÂY LÀ CHỖ CHỈNH SỐ GIÂY RESET HỘI THOẠI] (45000ms = 45s)
 
 // Groq Whisper LPU Speech-to-Text & Qwen Vision LLM (~250ms)
 #define GROQ_API_KEY            ""
@@ -234,6 +235,13 @@
 #define GROQ_MODEL              "whisper-large-v3-turbo"
 #define GROQ_VISION_MODEL_A     "qwen/qwen3.8-27b"
 #define GROQ_VISION_MODEL_B     "qwen/qwen3.6-27b"
+
+// Deepgram Nova STT (Tầng 2 STT - Hỗ trợ cả REST và Live WebSocket Streaming)
+#define DEEPGRAM_API_KEY        ""
+#define DEEPGRAM_API_HOST       "api.deepgram.com"
+#define DEEPGRAM_API_PORT       443
+#define DEEPGRAM_MODEL          "nova-3"
+#define ENABLE_DEEPGRAM_STREAMING 0   // 0 = REST Buffer (Ghi âm xong gửi WAV an toàn 100%), 1 = WebSocket
 
 // Hold-to-Talk: bấm giữ để ghi âm, thả để gửi (Thoải mái nói chuyện, tối đa 60 giây).
 #define AI_AUDIO_SAMPLE_RATE    16000

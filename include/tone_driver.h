@@ -27,6 +27,8 @@ void    tone_driver_set_sample_rate(uint32_t rate);
 // --- Sound Effects & Airplane Chimes ---
 void    tone_driver_play_startup(void);
 void    tone_driver_play_captain_chime(void);
+void    tone_driver_play_quick_beep(void);
+void    tone_driver_play_double_beep(void);
 void    tone_driver_play_release_chime(void);
 
 void    tone_driver_stream_init(void);

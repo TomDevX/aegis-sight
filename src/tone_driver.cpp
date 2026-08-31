@@ -433,6 +433,22 @@ void tone_driver_play_captain_chime(void) {
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
+// 2b. Tiếng "Tít" thanh mảnh siêu nhanh (Chirp ~35ms) cho phản hồi bấm nút tức thì
+void tone_driver_play_quick_beep(void) {
+    toneStopFlag = false;
+    streamActive = false;
+    play_bell_tone(880.0f, 35, 12.0f, 18); // Nốt A5 880Hz trong 35ms
+}
+
+// 2c. Tiếng "Tít-Tít" đôi (~90ms) báo hiệu Nối Tiếp Cuộc Trò Chuyện (Follow-up Turn)
+void tone_driver_play_double_beep(void) {
+    toneStopFlag = false;
+    streamActive = false;
+    play_bell_tone(880.0f, 30, 14.0f, 18);
+    vTaskDelay(pdMS_TO_TICKS(25));
+    play_bell_tone(1046.5f, 35, 12.0f, 20); // Nốt C6 cao hơn vui tai
+}
+
 // 3. Tiếng âm báo ngắt mic khi nhả nút (Warm Soft Two-Tone Chime: êm dịu, dứt khoát ~190ms)
 void tone_driver_play_release_chime(void) {
     toneStopFlag = false;
