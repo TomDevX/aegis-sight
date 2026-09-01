@@ -5,6 +5,7 @@
 // MPU6050 Registers
 #define MPU_REG_SMPLRT_DIV   0x19
 #define MPU_REG_CONFIG       0x1A
+#define MPU_REG_GYRO_CONFIG  0x1B
 #define MPU_REG_ACCEL_CONFIG 0x1C
 #define MPU_REG_ACCEL_XOUT_H 0x3B
 #define MPU_REG_PWR_MGMT_1   0x6B
@@ -66,6 +67,7 @@ static void recover_i2c_bus(void) {
     delayMicroseconds(2000);
     write_reg(activeMpuAddr, MPU_REG_CONFIG, 0x03);
     write_reg(activeMpuAddr, MPU_REG_ACCEL_CONFIG, 0x10);
+    write_reg(activeMpuAddr, MPU_REG_GYRO_CONFIG, 0x10);
 }
 
 bool mpu_manager_init(void) {
@@ -133,16 +135,18 @@ bool mpu_manager_init(void) {
     delay(10);
     write_reg(activeMpuAddr, MPU_REG_CONFIG, 0x03);       // DLPF 44Hz
     write_reg(activeMpuAddr, MPU_REG_ACCEL_CONFIG, 0x10); // +-8G range
+    write_reg(activeMpuAddr, MPU_REG_GYRO_CONFIG, 0x10);  // +-1000 deg/s range (32.8 LSB/(deg/s))
 
     mpuInitialized = true;
     i2cErrorCount = 0;
     emaSvG = 1.0f;
     xSemaphoreGive(i2cMutex);
-    Serial.printf("[MPU_MGR] MPU6050 I2C Ready at 0x%02X (+-8G, 44Hz DLPF, 50kHz)\n", foundAddr);
+    Serial.printf("[MPU_MGR] MPU6050 I2C Ready at 0x%02X (+-8G, +-1000dps, 44Hz DLPF, 50kHz)\n", foundAddr);
     return true;
 }
 
-bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float *out_svG) {
+bool mpu_manager_read_motion(float *out_ax, float *out_ay, float *out_az, float *out_svG,
+                             float *out_gx, float *out_gy, float *out_gz, float *out_gyroDegS) {
     if (!mpuInitialized) return false;
 
     if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
@@ -151,14 +155,21 @@ bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float
 
     bool readSuccess = false;
     int16_t rawAx = 0, rawAy = 0, rawAz = 0;
+    int16_t rawGx = 0, rawGy = 0, rawGz = 0;
 
     Wire.beginTransmission(activeMpuAddr);
     Wire.write(MPU_REG_ACCEL_XOUT_H);
     if (Wire.endTransmission(false) == 0) {
-        if (Wire.requestFrom((uint8_t)activeMpuAddr, (size_t)6, (bool)true) == 6) {
+        // Đọc trọn gói 14 bytes: 6 bytes Accel + 2 bytes Temp + 6 bytes Gyro
+        if (Wire.requestFrom((uint8_t)activeMpuAddr, (size_t)14, (bool)true) == 14) {
             rawAx = (int16_t)((Wire.read() << 8) | Wire.read());
             rawAy = (int16_t)((Wire.read() << 8) | Wire.read());
             rawAz = (int16_t)((Wire.read() << 8) | Wire.read());
+            // Bỏ qua Temp 2 bytes
+            Wire.read(); Wire.read();
+            rawGx = (int16_t)((Wire.read() << 8) | Wire.read());
+            rawGy = (int16_t)((Wire.read() << 8) | Wire.read());
+            rawGz = (int16_t)((Wire.read() << 8) | Wire.read());
             readSuccess = true;
         }
     }
@@ -176,14 +187,20 @@ bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float
     i2cErrorCount = 0;
     xSemaphoreGive(i2cMutex);
 
-    // Chuyển đổi sang đơn vị G (+-8G range -> 4096.0f LSB/G)
+    // Accel: +-8G -> 4096.0 LSB/G
     float ax = (float)rawAx / 4096.0f;
     float ay = (float)rawAy / 4096.0f;
     float az = (float)rawAz / 4096.0f;
     float sv = sqrtf(ax * ax + ay * ay + az * az);
 
+    // Gyro: +-1000 deg/s -> 32.8 LSB/(deg/s)
+    float gx = (float)rawGx / 32.8f;
+    float gy = (float)rawGy / 32.8f;
+    float gz = (float)rawGz / 32.8f;
+    float gyroDegS = sqrtf(gx * gx + gy * gy + gz * gz);
+
     // Lọc dữ liệu lỗi bất thường
-    if (isnan(sv) || sv > 16.0f || sv < 0.25f || (rawAx == 0 && rawAy == 0 && rawAz == 0)) {
+    if (isnan(sv) || sv > 16.0f || sv < 0.05f || (rawAx == 0 && rawAy == 0 && rawAz == 0)) {
         return false;
     }
 
@@ -194,6 +211,10 @@ bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float
     if (out_ay) *out_ay = ay;
     if (out_az) *out_az = az;
     if (out_svG) *out_svG = sv;
+    if (out_gx) *out_gx = gx;
+    if (out_gy) *out_gy = gy;
+    if (out_gz) *out_gz = gz;
+    if (out_gyroDegS) *out_gyroDegS = gyroDegS;
 
     lastAxG = ax;
     lastAyG = ay;
@@ -201,6 +222,10 @@ bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float
     lastSvG = sv;
     lastReadMs = millis();
     return true;
+}
+
+bool mpu_manager_read_accel_g(float *out_ax, float *out_ay, float *out_az, float *out_svG) {
+    return mpu_manager_read_motion(out_ax, out_ay, out_az, out_svG, NULL, NULL, NULL, NULL);
 }
 
 bool mpu_manager_read_sv_g(float *out_svG) {

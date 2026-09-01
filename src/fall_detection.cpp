@@ -24,8 +24,9 @@ static uint32_t lastSosAlarmBeepMs = 0;
 static uint8_t freeFallSamples = 0;
 static uint8_t movingSamples = 0;
 
-static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
-    if (ai_pipeline_is_busy() || (millis() - cancelCooldown < FALL_DEBOUNCE_MS)) {
+static void evaluate_fall_state(float ax, float ay, float az, float a_total, float gyroDegS) {
+    // Không bao giờ chặn fall detection khi AI đang chạy — té ngã vẫn phải phát hiện được
+    if (millis() - cancelCooldown < FALL_DEBOUNCE_MS) {
         fallPhase = FALL_IDLE;
         freeFallSamples = 0;
         movingSamples = 0;
@@ -36,32 +37,41 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
 
     switch (fallPhase) {
         case FALL_IDLE:
-            // 1. Nhánh 1: Rơi tự do / thả rơi trong không gian (0.15G <= a_total < 0.65G)
-            if (a_total >= 0.15f && a_total < 0.65f) {
-                fallPhase = FALL_FREE_FALL;
-                phaseTimer = now;
+            // 1. Nhánh 1: Rơi tự do + Cơ thể xoay lộn (0.10G <= a_total < 0.60G VÀ Gyro >= 120 deg/s)
+            // Lực mô-men quay góc bắt buộc phải có khi con người bị trượt chân / ngã nhào!
+            if (a_total >= 0.10f && a_total < 0.60f && gyroDegS >= 120.0f) {
+                freeFallSamples++;
+                if (freeFallSamples >= 2) { // Yêu cầu ít nhất 2 mẫu liên tiếp (50ms) chống nhiễu đơn lẻ
+                    fallPhase = FALL_FREE_FALL;
+                    phaseTimer = now;
+                    freeFallSamples = 0;
+                    movingSamples = 0;
+                    Serial.printf("\n[%6.2fs][FALL] >>> Phase 1: Rotational Free Fall DETECTED (SV=%.2fG, Gyro=%.0f dps) <<<\n", now / 1000.0f, a_total, gyroDegS);
+                }
+            } else if (a_total >= 0.10f && a_total < 0.60f) {
+                // Rơi tự do nhưng không có quay góc (chỉ là rung lắc / giật tay thẳng) -> bỏ qua
                 freeFallSamples = 0;
-                movingSamples = 0;
-                Serial.printf("\n[FALL] >>> Phase 1: Free Fall DETECTED (SV=%.2fG) <<<\n", a_total);
             }
-            // 2. Nhánh 2: Ném mạnh xuống / Quật ngã / Va đập chấn động dứt khoát (a_total > 2.20G)
-            else if (a_total > 2.20f) {
+            // 2. Nhánh 2: Quật ngã mạnh chấn động + xoay người dứt khoát (a_total > 2.60G VÀ Gyro >= 160 deg/s)
+            else if (a_total > 2.60f && gyroDegS >= 160.0f) {
                 fallPhase = FALL_IMPACT;
                 phaseTimer = now;
                 freeFallSamples = 0;
                 movingSamples = 0;
-                Serial.printf("\n[FALL] >>> Direct Throw / High-G Impact DETECTED (SV=%.2fG) <<<\n", a_total);
+                Serial.printf("\n[%6.2fs][FALL] >>> High-G Rotational Impact DETECTED (SV=%.2fG, Gyro=%.0f dps) <<<\n", now / 1000.0f, a_total, gyroDegS);
+            } else {
+                freeFallSamples = 0;
             }
             break;
 
         case FALL_FREE_FALL:
-            // Pha 2: Chờ va chạm tiếp đất (> 1.30G) trong cửa sổ 1000ms sau cú rơi
-            if (a_total > 1.30f) {
+            // Pha 2: Chờ va chạm tiếp đất (> 1.40G) trong cửa sổ 1000ms sau cú rơi
+            if (a_total > 1.40f) {
                 fallPhase = FALL_IMPACT;
                 phaseTimer = now;
                 freeFallSamples = 0;
                 movingSamples = 0;
-                Serial.printf("[FALL] >>> Phase 2: Landing Impact DETECTED (SV=%.2fG) <<<\n", a_total);
+                Serial.printf("[%6.2fs][FALL] >>> Phase 2: Landing Impact DETECTED (SV=%.2fG) <<<\n", now / 1000.0f, a_total);
             } else if (now - phaseTimer > 1000) { 
                 fallPhase = FALL_IDLE;
                 freeFallSamples = 0;
@@ -75,19 +85,19 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
                 phaseTimer = now;
                 lastStillPrintMs = now;
                 movingSamples = 0;
-                Serial.println("[FALL] >>> Phase 3: Monitoring post-fall stillness (3.0s)...");
+                Serial.printf("[%6.2fs][FALL] >>> Phase 3: Monitoring post-fall stillness (3.0s)...\n", now / 1000.0f);
             }
             break;
 
         case FALL_WAITING_STILL: {
             float diffFrom1G = fabsf(a_total - 1.0f);
 
-            // Nhạy hơn: Bất động khi |SV - 1.0G| <= 0.35G (0.65G đến 1.35G)
-            // Nếu có cử động hoặc đứng dậy (diffFrom1G > 0.35G trong 4 mẫu = 100ms) -> Hủy ngay báo ngã!
-            if (diffFrom1G > 0.35f) {
+            // Bất động: Gia tốc nằm trong dải 0.65G..1.35G VÀ Vận tốc góc Gyro < 40 deg/s (không cử động)
+            // Nếu có cử động hoặc đứng dậy (diffFrom1G > 0.35G hoặc Gyro > 45 deg/s) -> Hủy ngay báo ngã!
+            if (diffFrom1G > 0.35f || gyroDegS > 45.0f) {
                 movingSamples++;
                 if (movingSamples >= 4) {
-                    Serial.printf("[FALL] Active movement detected (SV=%.2fG) -> Fall Cancelled!\n", a_total);
+                    Serial.printf("[%6.2fs][FALL] Active movement detected (SV=%.2fG, Gyro=%.0f dps) -> Fall Cancelled!\n", now / 1000.0f, a_total, gyroDegS);
                     fallPhase = FALL_IDLE;
                     movingSamples = 0;
                 }
@@ -96,14 +106,17 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
 
                 if (now - lastStillPrintMs >= 350) {
                     lastStillPrintMs = now;
-                    Serial.printf("[FALL] Stillness: %.1fs / 3.0s (SV=%.2fG)\n", (float)(now - phaseTimer) / 1000.0f, a_total);
+                    Serial.printf("[%6.2fs][FALL] Stillness: %.1fs / 3.0s (SV=%.2fG, Gyro=%.0f dps)\n", now / 1000.0f, (float)(now - phaseTimer) / 1000.0f, a_total, gyroDegS);
                 }
 
                 // Nằm bất động đủ 3.0 giây sau cú rơi & va chạm -> XÁC NHẬN TÉ NGÃ VÀ HÚ CÒI SOS!
                 if (now - phaseTimer >= 3000) {
                     Serial.println("\n[FALL] ========================================");
-                    Serial.println("[FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<");
+                    Serial.printf("[%6.2fs][FALL] >>> XAC NHAN NGA! KICH HOAT COI SOS <<<\n", now / 1000.0f);
                     Serial.println("[FALL] ========================================\n");
+                    // Dừng mọi luồng AI/TTS ngay lập tức
+                    ai_pipeline_stop();
+                    tone_driver_stream_set_active(false);
                     alarmActive = true;
                     lastSosAlarmBeepMs = 0;
                     fallPhase = FALL_IDLE;
@@ -115,8 +128,8 @@ static void evaluate_fall_state(float ax, float ay, float az, float a_total) {
     }
 }
 
-void fall_detection_process_sample(float ax, float ay, float az, float svG) {
-    evaluate_fall_state(ax, ay, az, svG);
+void fall_detection_process_sample(float ax, float ay, float az, float svG, float gyroDegS) {
+    evaluate_fall_state(ax, ay, az, svG, gyroDegS);
 }
 
 void fall_detection_alarm_tick(void) {

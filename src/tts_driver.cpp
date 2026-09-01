@@ -4,6 +4,7 @@
 #ifdef ENABLE_TTS_CLOUD
 
 #include <WiFi.h>
+#include "offline_sounds.h"
 #include "AudioFileSourcePROGMEM.h"
 #include "AudioGeneratorMP3.h"
 #include "AudioOutput.h"
@@ -47,11 +48,15 @@ public:
 
     virtual bool begin() override {
         chunkIdx = 0;
+        ttsCancel = false;
         tone_driver_stream_set_active(true);
         return true;
     }
 
     virtual bool SetRate(int hz) override {
+        if (hz >= 8000 && hz <= 48000) {
+            tone_driver_set_sample_rate(hz);
+        }
         return true;
     }
 
@@ -64,15 +69,20 @@ public:
     }
 
     virtual bool ConsumeSample(int16_t sample[2]) override {
-        // Gộp 2 kênh stereo thành mono và tăng cường âm lượng Pre-amp Gain x2.2 cho giọng nói AI to rõ
+        // Gộp stereo thành mono chuẩn
         int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
-        int32_t boosted = (mixed * 22) / 10; // 2.2x Digital Gain Boost
 
-        // Soft limiting bảo vệ chống vỡ màng loa
-        if (boosted > 31000) boosted = 31000;
-        else if (boosted < -31000) boosted = -31000;
+        // Giọng nói AI: khuếch đại to rõ 2.8x với soft-limiting chống vỡ tiếng
+        float x = (float)mixed * 2.8f;
+        if (x > 26000.0f) {
+            x = 26000.0f + (x - 26000.0f) * 0.25f;
+        } else if (x < -26000.0f) {
+            x = -26000.0f + (x + 26000.0f) * 0.25f;
+        }
+        if (x > 32000.0f) x = 32000.0f;
+        else if (x < -32000.0f) x = -32000.0f;
 
-        monoChunk[chunkIdx++] = (int16_t)boosted;
+        monoChunk[chunkIdx++] = (int16_t)x;
 
         if (chunkIdx >= 128) {
             size_t written = 0;
@@ -96,8 +106,8 @@ public:
                 }
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
-            chunkIdx = 0;
         }
+        chunkIdx = 0;
         return true;
     }
 };
@@ -118,19 +128,41 @@ void tts_driver_speak(const char *text, size_t len) {
 
     String enc = url_encode_str(String(text));
 
-    Serial.printf("[TTS] Đang tải & phát: \"%.40s...\"\n", text);
+    Serial.printf("[%6.2fs][TTS] Đang tải & phát: \"%.40s...\"\n", millis() / 1000.0f, text);
 
     size_t mp3Len = 0;
 
     // 2. Tải toàn bộ MP3 vào RAM qua WiFiClient với dual-endpoint fallback (gtx -> tw-ob)
+    static IPAddress gttsCachedIp(0, 0, 0, 0);
+    static unsigned long lastDnsResolve = 0;
+    if (gttsCachedIp == IPAddress(0, 0, 0, 0) || (millis() - lastDnsResolve > 300000)) {
+        if (WiFi.hostByName("translate.google.com", gttsCachedIp)) {
+            lastDnsResolve = millis();
+        }
+    }
+
     for (int retry = 0; retry < 3 && mp3Len == 0 && !ttsCancel; retry++) {
         WiFiClient client;
-        client.setTimeout(1800);
+        client.setTimeout(1500);
 
-        if (!client.connect("translate.google.com", 80)) {
-            vTaskDelay(pdMS_TO_TICKS(30));
+        bool connected = false;
+        if (gttsCachedIp != IPAddress(0, 0, 0, 0)) {
+            connected = client.connect(gttsCachedIp, 80);
+        }
+        if (!connected) {
+            connected = client.connect("translate.google.com", 80);
+            if (connected) {
+                gttsCachedIp = client.remoteIP();
+                lastDnsResolve = millis();
+            }
+        }
+
+        if (!connected) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        client.setNoDelay(true);
 
         const char *clientType = (retry == 0) ? "gtx" : "tw-ob";
         String path = "/translate_tts?ie=UTF-8&tl=vi&client=" + String(clientType) + "&q=" + enc;
@@ -144,13 +176,13 @@ void tts_driver_speak(const char *text, size_t len) {
         // Bỏ qua HTTP Headers
         bool headerDone = false;
         bool is200 = false;
-        uint32_t tmo = millis() + 3000;
+        uint32_t tmo = millis() + 2500;
         char hdr[256];
         bool firstLine = true;
 
         while (client.connected() && millis() < tmo && !ttsCancel) {
             size_t n = client.readBytesUntil('\n', (uint8_t *)hdr, sizeof(hdr) - 1);
-            if (n == 0) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+            if (n == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
             hdr[n] = '\0';
             while (n > 0 && (hdr[n-1] == '\r' || hdr[n-1] == ' ')) hdr[--n] = '\0';
 
@@ -163,21 +195,24 @@ void tts_driver_speak(const char *text, size_t len) {
 
         if (!headerDone || !is200 || ttsCancel) {
             client.stop();
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
-        // Tải body MP3 siêu tốc
+        // Tải body MP3 siêu tốc (chunk 4KB)
         while (mp3Len < TTS_MP3_BUF_SIZE && !ttsCancel) {
-            if (client.available()) {
+            int avail = client.available();
+            if (avail > 0) {
                 int room = TTS_MP3_BUF_SIZE - mp3Len;
-                int got = client.read(mp3Buf + mp3Len, room > 2048 ? 2048 : room);
+                int toRead = (room > 4096) ? 4096 : room;
+                if (toRead > avail) toRead = avail;
+                int got = client.read(mp3Buf + mp3Len, toRead);
                 if (got <= 0) break;
                 mp3Len += got;
             } else if (!client.connected()) {
                 break;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(1));
+                taskYIELD();
             }
         }
         client.stop();
@@ -189,7 +224,7 @@ void tts_driver_speak(const char *text, size_t len) {
         return;
     }
 
-    Serial.printf("[TTS] Tải xong %zu bytes MP3. Bắt đầu giải mã...\n", mp3Len);
+    Serial.printf("[%6.2fs][TTS] Tải xong %zu bytes MP3. Bắt đầu giải mã...\n", millis() / 1000.0f, mp3Len);
 
     // 3. Giải mã siêu tốc từ RAM bằng AudioFileSourcePROGMEM
     AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(mp3Buf, mp3Len);
@@ -211,7 +246,7 @@ void tts_driver_speak(const char *text, size_t len) {
             }
         }
     } else {
-        Serial.println("[TTS] mp3->begin thất bại!");
+        Serial.printf("[%6.2fs][TTS] mp3->begin thất bại!\n", millis() / 1000.0f);
     }
 
     out->stop();
@@ -221,6 +256,36 @@ void tts_driver_speak(const char *text, size_t len) {
     delete out;
     free(mp3Buf);
 
+    ttsBusy = false;
+}
+
+// Phát âm thanh MP3 Offline từ bộ nhớ Flash ROM (PROGMEM) không cần mạng
+void tts_driver_play_progmem(const uint8_t *data, size_t len) {
+    if (!data || len == 0) return;
+    ttsBusy = true;
+    ttsCancel = false;
+
+    AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(data, len);
+    AudioOutputToToneDriver *out = new AudioOutputToToneDriver();
+    AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+
+    out->begin();
+
+    if (mp3->begin(file, out)) {
+        uint32_t loopCount = 0;
+        while (mp3->isRunning() && !ttsCancel) {
+            if (!mp3->loop()) break;
+            loopCount++;
+            if ((loopCount & 0x07) == 0) taskYIELD();
+        }
+    } else {
+        Serial.printf("[%6.2fs][TTS] mp3->begin PROGMEM thất bại!\n", millis() / 1000.0f);
+    }
+
+    out->stop();
+    delete mp3;
+    delete file;
+    delete out;
     ttsBusy = false;
 }
 

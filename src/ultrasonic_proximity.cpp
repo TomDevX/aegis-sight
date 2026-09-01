@@ -151,9 +151,11 @@ static void ultrasonic_task(void *pvParameters) {
 
         // 1. Bước 1: Đọc MPU6050 (Lúc này chân Trig siêu âm hoàn toàn im lặng, I2C đọc mượt 100%)
         float ax = 0, ay = 0, az = 0, svG = 1.0f;
-        bool mpuOk = mpu_manager_read_accel_g(&ax, &ay, &az, &svG);
+        float gx = 0, gy = 0, gz = 0, gyroDegS = 0.0f;
+        bool mpuOk = mpu_manager_read_motion(&ax, &ay, &az, &svG, &gx, &gy, &gz, &gyroDegS);
         if (mpuOk) {
-            fall_detection_process_sample(ax, ay, az, svG);
+            motion_gate_update(svG, gyroDegS);
+            fall_detection_process_sample(ax, ay, az, svG, gyroDegS);
         }
 
         // Duy trì còi hú cứu hộ SOS nếu đang có cảnh báo ngã
@@ -171,6 +173,8 @@ static void ultrasonic_task(void *pvParameters) {
             }
         }
 
+        bool isMoving = motion_gate_enabled();
+
         // 3. Debug log định kỳ mỗi 2 giây
         #if US_DEBUG
         if (now - lastDebugMs >= US_DEBUG_INTERVAL) {
@@ -178,16 +182,18 @@ static void ultrasonic_task(void *pvParameters) {
             String distStr = (lastDistance > 0) ? (String(lastDistance, 1) + "cm") : "CLEAR (>45cm)";
             
             if (mpuOk) {
-                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
-                              distStr.c_str(), zone_name(current_zone), svG, ax, ay, az);
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | Motion=%s | MPU: SV=%.2fG (ax=%.2f ay=%.2f az=%.2f)\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone),
+                              isMoving ? "MOVING" : "STILL", svG, ax, ay, az);
             } else {
-                Serial.printf("[SENSOR] Dist=%s | Zone=%s | MPU: [DISCONNECTED / Check Wire]\n",
-                              distStr.c_str(), zone_name(current_zone));
+                Serial.printf("[%6.2fs][SENSOR] Dist=%s | Zone=%s | Motion=%s | MPU: [DISCONNECTED / Check Wire]\n",
+                              now / 1000.0f, distStr.c_str(), zone_name(current_zone),
+                              isMoving ? "MOVING" : "STILL");
             }
 
             if (current_zone != last_printed_zone) {
-                Serial.printf("[US] *** ZONE CHANGE: %s -> %s ***\n",
-                              zone_name(last_printed_zone), zone_name(current_zone));
+                Serial.printf("[%6.2fs][US] *** ZONE CHANGE: %s -> %s ***\n",
+                              now / 1000.0f, zone_name(last_printed_zone), zone_name(current_zone));
                 last_printed_zone = current_zone;
             }
         }
@@ -197,7 +203,10 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = get_zone(lastDistance, current_zone);
             uint32_t beepInterval = get_beep_interval(current_zone);
 
-            if (beepInterval > 0 && (now - lastBeep >= beepInterval)) {
+            // CHỈ PHÁT TIẾNG BÍP KHI:
+            // 1. Không bận AI (!ai_pipeline_is_busy())
+            // 2. Người dùng ĐANG DI CHUYỂN / BƯỚC ĐI (motion_gate_enabled()) -> Khi đứng yên/ngồi yên sẽ im lặng 100%!
+            if (!ai_pipeline_is_busy() && isMoving && beepInterval > 0 && (now - lastBeep >= beepInterval)) {
                 lastBeep = now;
                 uint8_t vol = tone_driver_get_volume();
                 if (vol < 18) vol = 20;
@@ -214,7 +223,7 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = ZONE_NONE;
         }
 
-        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz siêu mượt và nhẹ tải CPU)
+        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz bảo đảm độ nhạy phát hiện té ngã)
         vTaskDelay(pdMS_TO_TICKS(25));
     }
 }

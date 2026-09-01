@@ -5,6 +5,7 @@
 #include "tone_driver.h"
 #include "tts_driver.h"
 #include "secrets.h"
+#include "offline_sounds.h"
 #include <ArduinoJson.h>
 
 #ifdef ENABLE_AI_PIPELINE
@@ -23,46 +24,13 @@ static uint8_t *jpegBuf = NULL;      // JPEG sau khi nén bằng fmt2jpg
 static size_t   jpegSize = 0;
 static int16_t *recordBuf = NULL;    // PCM ghi âm từ mic (Hold-to-Talk)
 static volatile size_t recordSamples = 0;
-static volatile bool dataReady = false;
 static volatile bool pipelineBusy = false;
+static volatile bool dataReady    = false;
 
 #define WAV_HEADER_SIZE       44
 #define RECORD_MIN_MS         300     // tối thiểu 300ms mới coi là có câu hỏi
 
 static bool alloc_buffers(void);
-
-// Forward declarations
-static bool   is_sentence_end(const String &buf, size_t i);
-static String normalize_text(const String &text);
-static void   speak_text(const String &text);
-
-// ============================================================
-// HTTP helpers
-// ============================================================
-static bool http_read_line(WiFiClient &cl, char *buf, size_t sz, int tmoMs) {
-    size_t pos = 0;
-    unsigned long t0 = millis();
-    while (millis() - t0 < (unsigned long)tmoMs) {
-        if (cl.available()) {
-            int c = cl.read();
-            if (c < 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
-            if (c == '\n') { buf[pos] = 0; return true; }
-            if (c != '\r' && pos < sz - 1) buf[pos++] = (char)c;
-            t0 = millis();
-        } else if (!cl.connected()) break;
-        else vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    buf[pos] = 0;
-    return pos > 0 || cl.connected();
-}
-
-static bool http_skip_headers(WiFiClient &cl, int tmoMs) {
-    char buf[256];
-    while (true) {
-        if (!http_read_line(cl, buf, sizeof(buf), tmoMs)) return false;
-        if (buf[0] == 0) return true;
-    }
-}
 
 // ============================================================
 // Text normalization
@@ -103,6 +71,7 @@ static void queue_sentence_for_tts(const String &text) {
     }
 }
 
+// Core 0 task: nhận câu từ queue và phát TTS tuần tự từng câu siêu tốc
 static void tts_worker_task(void *pv) {
     while (true) {
         char *sentence = NULL;
@@ -118,7 +87,7 @@ static void tts_worker_task(void *pv) {
 }
 
 // ============================================================
-// Sentence boundary ('.' bỏ qua giữa 2 chữ số; ngắt ở ',' sau 20 ký tự để phát ngay câu đầu)
+// Sentence boundary: ngắt từng câu một (khi gặp dấu câu đầu tiên) để phát ra loa tức thì
 // ============================================================
 static bool is_sentence_end(const String &buf, size_t i) {
     char c = buf[i];
@@ -128,24 +97,28 @@ static bool is_sentence_end(const String &buf, size_t i) {
         bool n = i + 1 < buf.length() && isdigit(buf[i+1]);
         return !(p && n);
     }
-    // Ngắt sớm ở dấu phẩy/chấm phẩy/gạch ngang nếu cụm từ đã có từ 10 ký tự để phát ra loa tức thì!
-    if ((c == ',' || c == ';' || c == ':' || c == '-') && i >= 10) {
-        return true;
-    }
     return false;
 }
 
 static String ttsSentenceBuf;
 
 static void flush_sentences(void) {
-    int lastBoundary = -1;
-    for (int i = 0; i < (int)ttsSentenceBuf.length(); i++)
-        if (is_sentence_end(ttsSentenceBuf, i)) lastBoundary = i;
-    if (lastBoundary >= 0) {
-        String complete = ttsSentenceBuf.substring(0, lastBoundary + 1);
-        complete.trim();
-        if (complete.length() > 0) queue_sentence_for_tts(complete);
-        ttsSentenceBuf = ttsSentenceBuf.substring(lastBoundary + 1);
+    while (true) {
+        int firstBoundary = -1;
+        for (int i = 0; i < (int)ttsSentenceBuf.length(); i++) {
+            if (is_sentence_end(ttsSentenceBuf, i)) {
+                firstBoundary = i;
+                break;
+            }
+        }
+        if (firstBoundary >= 0) {
+            String complete = ttsSentenceBuf.substring(0, firstBoundary + 1);
+            complete.trim();
+            if (complete.length() > 0) queue_sentence_for_tts(complete);
+            ttsSentenceBuf = ttsSentenceBuf.substring(firstBoundary + 1);
+        } else {
+            break;
+        }
     }
 }
 
@@ -205,10 +178,10 @@ static bool try_ssid(const char *ssid, const char *pass, int tries) {
         vTaskDelay(pdMS_TO_TICKS(250)); c++;
     }
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WIFI] OK! IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("[%6.2fs][WIFI] OK! IP: %s\n", millis() / 1000.0f, WiFi.localIP().toString().c_str());
         return true;
     }
-    Serial.println("[WIFI] Thất bại");
+    Serial.printf("[%6.2fs][WIFI] Thất bại\n", millis() / 1000.0f);
     return false;
 }
 
@@ -313,7 +286,7 @@ static bool rec_mic_install(void) {
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
         .dma_buf_len = 256,
-        .use_apll = true, // Khóa xung nhịp Audio PLL chuẩn xác 100% không bị lệch pitch/tần số
+        .use_apll = false,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0
     };
@@ -334,68 +307,243 @@ static bool rec_mic_install(void) {
     return true;
 }
 
+#if ENABLE_DEEPGRAM_STREAMING
+static WiFiClientSecure deepgramWsClient;
+static bool deepgramWsConnected = false;
+static String liveStreamedText = "";
+
+static bool deepgram_ws_connect(void) {
+    if (strlen(DEEPGRAM_API_KEY) == 0) return false;
+    deepgramWsClient.setInsecure();
+    deepgramWsClient.setHandshakeTimeout(3);
+    deepgramWsClient.setTimeout(4000);
+    if (!deepgramWsClient.connect(DEEPGRAM_API_HOST, DEEPGRAM_API_PORT)) {
+        return false;
+    }
+
+    String path = String("/v1/listen?model=") + DEEPGRAM_MODEL + "&language=vi&encoding=linear16&sample_rate=16000&channels=1&smart_format=true&punctuate=true&numerals=true&endpointing=20&utterance_end_ms=1000&vad_events=true";
+    
+    deepgramWsClient.printf("GET %s HTTP/1.1\r\n", path.c_str());
+    deepgramWsClient.printf("Host: %s\r\n", DEEPGRAM_API_HOST);
+    deepgramWsClient.printf("Upgrade: websocket\r\n");
+    deepgramWsClient.printf("Connection: Upgrade\r\n");
+    deepgramWsClient.printf("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+    deepgramWsClient.printf("Sec-WebSocket-Version: 13\r\n");
+    deepgramWsClient.printf("Authorization: Token %s\r\n\r\n", DEEPGRAM_API_KEY);
+
+    unsigned long start = millis();
+    char lineBuf[256];
+    bool upgraded = false;
+    while ((millis() - start < 3000) && deepgramWsClient.connected()) {
+        if (deepgramWsClient.available()) {
+            size_t n = deepgramWsClient.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf)-1);
+            lineBuf[n] = '\0';
+            if (strstr(lineBuf, "101 Switching Protocols") || strstr(lineBuf, "101 ")) {
+                upgraded = true;
+            }
+            if (n <= 2 && upgraded) break;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+    deepgramWsConnected = upgraded;
+    liveStreamedText = "";
+    if (upgraded) {
+        Serial.printf("[%6.2fs][DEEPGRAM] WebSocket Live Streaming Connected!\n", millis() / 1000.0f);
+    }
+    return upgraded;
+}
+
+static bool deepgram_ws_send_pcm(const int16_t *pcm, size_t count) {
+    if (!deepgramWsConnected || count == 0) return false;
+    size_t len = count * sizeof(int16_t);
+    uint8_t header[8];
+    size_t hLen = 0;
+    header[0] = 0x82; // FIN + Binary Frame
+    if (len < 126) {
+        header[1] = 0x80 | (uint8_t)len;
+        hLen = 2;
+    } else {
+        header[1] = 0x80 | 126;
+        header[2] = (len >> 8) & 0xFF;
+        header[3] = len & 0xFF;
+        hLen = 4;
+    }
+    header[hLen++] = 0x12; header[hLen++] = 0x34;
+    header[hLen++] = 0x56; header[hLen++] = 0x78;
+
+    deepgramWsClient.write(header, hLen);
+
+    uint8_t mask[4] = { 0x12, 0x34, 0x56, 0x78 };
+    const uint8_t *rawBytes = (const uint8_t *)pcm;
+    uint8_t maskedBuf[1024];
+    for (size_t i = 0; i < len; i++) {
+        maskedBuf[i] = rawBytes[i] ^ mask[i % 4];
+    }
+    deepgramWsClient.write(maskedBuf, len);
+    return true;
+}
+
+static String deepgram_ws_finish_and_get_text(void) {
+    if (!deepgramWsConnected) return "";
+    const char *closeMsg = "{\"type\":\"CloseStream\"}";
+    size_t cLen = strlen(closeMsg);
+    uint8_t closeHeader[6];
+    closeHeader[0] = 0x81;
+    closeHeader[1] = 0x80 | (uint8_t)cLen;
+    closeHeader[2] = 0x00; closeHeader[3] = 0x00; closeHeader[4] = 0x00; closeHeader[5] = 0x00;
+    deepgramWsClient.write(closeHeader, 6);
+    deepgramWsClient.write((const uint8_t *)closeMsg, cLen);
+    deepgramWsClient.flush();
+
+    String fullTranscript = "";
+    unsigned long startWait = millis();
+    while (deepgramWsClient.connected() && (millis() - startWait < 2000)) {
+        if (deepgramWsClient.available() >= 2) {
+            uint8_t b1 = deepgramWsClient.read();
+            uint8_t b2 = deepgramWsClient.read();
+            size_t pLen = b2 & 0x7F;
+            if (pLen == 126) {
+                while (deepgramWsClient.available() < 2 && millis() - startWait < 2000) vTaskDelay(1);
+                pLen = (deepgramWsClient.read() << 8) | deepgramWsClient.read();
+            }
+            if (pLen > 0) {
+                String jsonPayload = "";
+                while (pLen > 0 && deepgramWsClient.available()) {
+                    jsonPayload += (char)deepgramWsClient.read();
+                    pLen--;
+                }
+                char *txtKey = strstr(jsonPayload.c_str(), "\"transcript\":\"");
+                if (txtKey) {
+                    char *valStart = txtKey + 14;
+                    char *p = valStart;
+                    String piece = "";
+                    while (*p && *p != '\"') {
+                        if (*p == '\\' && *(p+1)) {
+                            p++;
+                            if (*p == 'n') piece += '\n';
+                            else piece += *p;
+                        } else piece += *p;
+                        p++;
+                    }
+                    piece.trim();
+                    if (piece.length() > 0) {
+                        if (fullTranscript.length() > 0) fullTranscript += " ";
+                        fullTranscript += piece;
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    deepgramWsClient.stop();
+    deepgramWsConnected = false;
+    fullTranscript.trim();
+    return fullTranscript;
+}
+#endif
+
 // ============================================================
-// Ghi âm từ lúc NHẤN tới khi THẢ nút (tối đa AI_AUDIO_MAX_RECORD_MS)
+// Core 1: Ghi âm liên tục từ mic vào recordBuf cho đến khi thả nút
 // ============================================================
 static size_t record_until_release(void) {
+    if (!recordBuf) return 0;
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     rec_mic_install();
     i2s_zero_dma_buffer(I2S_MIC_PORT);
 
-    int32_t *rawBuf = (int32_t *)ps_malloc(512 * sizeof(int32_t));
-    if (!rawBuf) {
-        return 0;
-    }
+#if ENABLE_DEEPGRAM_STREAMING
+    deepgram_ws_connect();
+#endif
 
+    int32_t i2sBuffer[512];
     size_t samples = 0;
     float dc_offset = 0.0f;
-    float sumSq = 0.0f;
+    double sumSq = 0.0;
     int16_t maxPeak = 0;
 
     size_t dummy_bytes = 0;
-    i2s_read(I2S_MIC_PORT, rawBuf, 512 * sizeof(int32_t), &dummy_bytes, 100);
+    i2s_read(I2S_MIC_PORT, i2sBuffer, sizeof(i2sBuffer), &dummy_bytes, 100);
 
     unsigned long start = millis();
+    bool released = false;
+    unsigned long releaseTime = 0;
+    int highStableCount = 0;
 
     while ((millis() - start < AI_AUDIO_MAX_RECORD_MS) &&
            (samples < AI_AUDIO_MAX_SAMPLES)) {
-        // Thả nút -> kết thúc ghi âm
-        if ((millis() - start > RECORD_MIN_MS) && digitalRead(BTN_TRIGGER) == HIGH) break;
+        
+        // Chống nhiễu rung phím tuyệt đối: Chỉ coi là nhả nút khi tín hiệu HIGH duy trì ổn định
+        if (digitalRead(BTN_TRIGGER) == HIGH) {
+            highStableCount++;
+            if (!released && highStableCount >= 3) {
+                released = true;
+                releaseTime = millis();
+            }
+        } else {
+            // Người dùng vẫn đang đè nút -> Reset ngay trạng thái nhả nút!
+            highStableCount = 0;
+            released = false;
+        }
+
+        if (released && (millis() - releaseTime >= 250)) {
+            break;
+        }
 
         size_t bytes_read = 0;
-        esp_err_t res = i2s_read(I2S_MIC_PORT, rawBuf, 512 * sizeof(int32_t),
+        esp_err_t res = i2s_read(I2S_MIC_PORT, i2sBuffer, sizeof(i2sBuffer),
                                  &bytes_read, portMAX_DELAY);
         if (res != ESP_OK || bytes_read == 0) continue;
 
-        size_t count = bytes_read / sizeof(int32_t);
-        for (size_t i = 0; i < count; i++) {
+        int samplesCount = bytes_read / sizeof(int32_t);
+        size_t chunkStart = samples;
+
+        for (int i = 0; i < samplesCount; i++) {
             if (samples >= AI_AUDIO_MAX_SAMPLES) break;
 
-            // Đưa mẫu 24-bit từ INMP441 về 16-bit chuẩn xác không méo tiếng
-            int32_t s16 = rawBuf[i] >> 14;
+            // Trích xuất chuẩn xác từ 32-bit I2S slot của INMP441 (giống mic_test.cpp)
+            int32_t s16 = i2sBuffer[i] >> 14;
             float sample = (float)s16;
 
-            // Khử DC offset tự nhiên
+            // 1. Lọc DC Offset
             dc_offset = 0.995f * dc_offset + 0.005f * sample;
-            float clean = (sample - dc_offset) * 3.0f;
+            float clean_sample = (sample - dc_offset) * 2.5f;
 
-            if (clean > 32000.0f) clean = 32000.0f;
-            else if (clean < -32000.0f) clean = -32000.0f;
+            // 2. Triệt tiêu hoàn toàn tạp âm xì xào nền (Noise Gate 300 LSB)
+            if (fabsf(clean_sample) < 300.0f) {
+                clean_sample = 0.0f;
+            }
 
-            int16_t pcm16 = (int16_t)clean;
-            recordBuf[samples++] = pcm16;
+            if (clean_sample > 30000.0f) clean_sample = 30000.0f;
+            else if (clean_sample < -30000.0f) clean_sample = -30000.0f;
 
-            sumSq += (float)pcm16 * (float)pcm16;
-            if (abs(pcm16) > maxPeak) maxPeak = abs(pcm16);
+            int16_t sample_16bit = (int16_t)clean_sample;
+            recordBuf[samples++] = sample_16bit;
+
+            sumSq += (double)sample_16bit * (double)sample_16bit;
+            if (abs(sample_16bit) > maxPeak) maxPeak = abs(sample_16bit);
         }
+
+#if ENABLE_DEEPGRAM_STREAMING
+        if (samples > chunkStart) {
+            deepgram_ws_send_pcm(recordBuf + chunkStart, samples - chunkStart);
+        }
+#endif
     }
 
-    free(rawBuf);
+#if ENABLE_DEEPGRAM_STREAMING
+    liveStreamedText = deepgram_ws_finish_and_get_text();
+#endif
 
     unsigned long elapsedMs = millis() - start;
     float rms = (samples > 0) ? sqrtf(sumSq / samples) : 0.0f;
     Serial.printf("[AI] Ghi âm xong: %zu samples (%lu ms) | RMS=%.0f | Peak=%d\n",
                   samples, elapsedMs, rms, maxPeak);
 
+    // Padding tối thiểu 250ms cho file WAV
     if (samples < 4000) {
         while (samples < 4000) {
             recordBuf[samples++] = 0;
@@ -450,16 +598,41 @@ static bool capture_jpeg(void) {
     return false;
 }
 
+// Quản lý Trạng Thái Hội Thoại (Stateful Interactions API) của Google Gemini
+static String lastInteractionId = "";
+static unsigned long lastInteractionMs = 0;
+
+// Quản lý Trạng Thái Hội Thoại Đa Lượt (Multi-Turn Context) cho Groq Vision
+static String lastGroqUserPrompt = "";
+static String lastGroqAiReply = "";
+static uint8_t *lastSavedImgB64 = NULL;
+static size_t lastSavedImgB64Len = 0;
+
+static void clear_session_memory(void) {
+    lastInteractionId = "";
+    lastGroqUserPrompt = "";
+    lastGroqAiReply = "";
+    if (lastSavedImgB64) {
+        free(lastSavedImgB64);
+        lastSavedImgB64 = NULL;
+    }
+    lastSavedImgB64Len = 0;
+}
+
+// Cờ phân biệt: Bấm 1 lần = Chủ đề mới hoàn toàn, Bấm đúp 2 lần = Nối tiếp hội thoại cũ
+static bool isFollowUpSession = false;
+
 // ============================================================
-// Core 1: Nút nhấn Hold-to-Talk + chụp ảnh
-// Bấm giữ  -> ghi âm mic ngay lập tức (không bị trễ)
-// Thả nút  -> dừng ghi âm, chụp JPEG, báo dataReady cho Core 0
-// Bấm lần nữa khi đang chạy -> HỦY pipeline
+// Core 1: Nút nhấn Hold-to-Talk + Chụp ảnh
+// Bấm 1 lần giữ     -> Tiếng "Tít" đơn   -> Chủ đề mới tinh (Xóa nhớ cũ)
+// Bấm đúp 2 lần giữ -> Tiếng "Tít-Tít"   -> Nối tiếp hội thoại (Soi lại ảnh cũ)
 // ============================================================
 static void ai_audio_task(void *pv) {
     pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    alloc_buffers(); // Cấp phát PSRAM ngay khi khởi động để lần bấm đầu tiên luôn sẵn sàng 100%!
     int lastBtn = HIGH;
     uint32_t debounceMs = 0;
+    uint32_t lastBtnReleaseMs = 0;
     while (true) {
         int btn = digitalRead(BTN_TRIGGER);
         uint32_t now = millis();
@@ -479,32 +652,89 @@ static void ai_audio_task(void *pv) {
             }
             #endif
             if (!pipelineBusy) {
+                // Khử rung dội phím ban đầu
+                vTaskDelay(pdMS_TO_TICKS(15));
+                if (digitalRead(BTN_TRIGGER) != LOW) {
+                    lastBtn = HIGH;
+                    continue;
+                }
+
                 if (!alloc_buffers()) continue;
+
+                uint32_t pressStart = millis();
+                bool isHold = false;
+                
+                // Đợi tối đa 250ms xem người dùng đè giữ hay nhấp nhả
+                while (digitalRead(BTN_TRIGGER) == LOW) {
+                    if (millis() - pressStart >= 250) {
+                        isHold = true;
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+
+                if (isHold) {
+                    // 1. BẤM GIỮ ĐƠN (HOLD TO TALK) -> HỎI CÂU HỎI MỚI (CHỦ ĐỀ MỚI)
+                    isFollowUpSession = false;
+                    clear_session_memory();
+                    Serial.printf("[%6.2fs][BTN] >>> BẤM GIỮ ĐƠN: HỎI CÂU HỎI MỚI <<< \n", millis() / 1000.0f);
+                    tone_driver_play_quick_beep(); // 🎵 Tiếng "Tít" đơn
+                    recordSamples = record_until_release();
+                } else {
+                    // Người dùng vừa nhấp nhả nhanh (< 250ms)
+                    // Đợi tối đa 300ms xem có cái nhấn thứ 2 không (Double-Click)
+                    uint32_t waitSecond = millis();
+                    bool hasSecondPress = false;
+                    while (millis() - waitSecond < 300) {
+                        if (digitalRead(BTN_TRIGGER) == LOW) {
+                            vTaskDelay(pdMS_TO_TICKS(15)); // Chống rung phím lần 2
+                            if (digitalRead(BTN_TRIGGER) == LOW) {
+                                hasSecondPress = true;
+                                break;
+                            }
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                    }
+
+                    if (hasSecondPress) {
+                        // 2. BẤM ĐÚP (DOUBLE-CLICK) -> NỐI TIẾP HỘI THOẠI CŨ (GIỮ NGUYÊN TRÍ NHỚ)
+                        isFollowUpSession = true;
+                        Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI (GIỮ TRÍ NHỚ) <<< \n", millis() / 1000.0f);
+                        tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
+                        recordSamples = record_until_release();
+                    } else {
+                        // 3. NHẤP NHANH 1 CÁI (SINGLE CLICK) -> CHỤP ẢNH MÔ TẢ NGAY (KHÔNG GHI ÂM)
+                        isFollowUpSession = false;
+                        clear_session_memory();
+                        Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH 1 CÁI: CHỤP ẢNH MÔ TẢ NGAY <<< \n", millis() / 1000.0f);
+                        tone_driver_play_quick_beep();
+                        recordSamples = 0;
+                    }
+                }
+
+                // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
+                setCpuFrequencyMhz(240);
 
                 tts_driver_stop();
 
                 pipelineBusy = true;
                 dataReady = false;
                 jpegSize = 0;
-                recordSamples = 0;
 
-                // Bíp nhẹ 40ms báo hiệu bắt đầu lắng nghe
-                tone_driver_play(1046, 40, 18);
-                vTaskDelay(pdMS_TO_TICKS(50));
-
-                // 1. Thu âm mic NGAY LẬP TỨC từ mili-giây đầu tiên khi giữ nút
-                recordSamples = record_until_release();
-
-                // 2. Chụp ảnh ngay khi vừa thả nút
+                // Chụp ảnh ngay lập tức
                 if (!capture_jpeg()) {
                     pipelineBusy = false;
                     continue;
                 }
 
                 dataReady = true;
-                Serial.printf("[AI] Đã thu âm %zu samples + ảnh -> Gửi lên Gemini...\n", recordSamples);
+                // Bật nhạc chờ Elevator Music từ PSRAM (Zero-CPU) trong lúc gửi và chờ AI xử lý
+                tone_driver_waiting_music_set(true);
+                Serial.printf("[%6.2fs][AI] Đã chụp ảnh (%zu bytes) + %zu samples audio -> Gửi lên Gemini [%s]...\n",
+                              millis() / 1000.0f, jpegSize, recordSamples, isFollowUpSession ? "Nối tiếp" : "Mới");
             } else {
                 // Bấm trong lúc đang chạy -> hủy
+                tone_driver_waiting_music_set(false);
                 tts_driver_stop();
                 tone_driver_stream_set_active(false);
                 pipelineBusy = false; dataReady = false;
@@ -514,8 +744,9 @@ static void ai_audio_task(void *pv) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
+
 // ============================================================
-// Stream dữ liệu lớn lên socket SSL theo chunk 1KB bền bỉ
+// Stream dữ liệu lớn lên socket SSL siêu tốc (4KB chunks)
 // ============================================================
 static bool stream_to_client(WiFiClientSecure &client, const uint8_t *data, size_t len) {
     if (!data || len == 0) return false;
@@ -523,137 +754,402 @@ static bool stream_to_client(WiFiClientSecure &client, const uint8_t *data, size
     size_t offset = 0;
     while (offset < len) {
         if (!pipelineBusy || !client.connected()) return false;
-        size_t chunk = (len - offset > 1024) ? 1024 : (len - offset);
+        size_t chunk = (len - offset > 4096) ? 4096 : (len - offset);
         size_t written = client.write(data + offset, chunk);
         if (written == 0) {
-            vTaskDelay(pdMS_TO_TICKS(25));
+            vTaskDelay(pdMS_TO_TICKS(2));
             written = client.write(data + offset, chunk);
             if (written == 0) {
-                Serial.printf("[NET] Lỗi ghi socket tại offset %zu/%zu\n", offset, len);
+                Serial.printf("[%6.2fs][NET] Lỗi ghi socket tại offset %zu/%zu\n", millis() / 1000.0f, offset, len);
                 return false;
             }
         }
         offset += written;
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
     return true;
 }
 
+static WiFiClientSecure groqSttClient;
+
+static void pre_connect_groq(void) {
+    if (!groqSttClient.connected()) {
+        groqSttClient.setInsecure();
+        groqSttClient.setHandshakeTimeout(4);
+        groqSttClient.setTimeout(5000);
+        groqSttClient.connect(GROQ_API_HOST, GROQ_API_PORT);
+    }
+}
+
 // ============================================================
-// Core 0: Gửi ảnh JPEG + audio WAV tới Gemini
+// Core 0: Gửi Audio WAV lên Groq LPU Whisper STT (~250ms)
 // ============================================================
-static String send_audio_image_to_gemini(void) {
-    if (cached_api_key.length() == 0) {
-        Serial.println("[AI] CHƯA CÓ API KEY!");
-        return "";
-    }
-    if (jpegBuf == NULL || jpegSize == 0) {
-        Serial.println("[AI] Chưa có ảnh để gửi!");
-        return "";
-    }
+static String groq_whisper_transcribe(const uint8_t *wavBuf, size_t wavSize, bool &isNetworkError) {
+    isNetworkError = false;
+    if (wavBuf == NULL || wavSize <= WAV_HEADER_SIZE) return "";
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(25);
-
-    Serial.println("[NET] Đang kết nối tới Gemini API...");
-    if (!client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
-        Serial.println("[NET] Kết nối AI thất bại!");
-        return "";
+    if (!groqSttClient.connected()) {
+        Serial.printf("[%6.2fs][GROQ] Đang kết nối tới Groq LPU (Whisper STT)...\n", millis() / 1000.0f);
+        groqSttClient.setInsecure();
+        groqSttClient.setHandshakeTimeout(4);
+        groqSttClient.setTimeout(5000);
+        if (!groqSttClient.connect(GROQ_API_HOST, GROQ_API_PORT)) {
+            Serial.printf("[%6.2fs][GROQ] Lỗi kết nối tới %s!\n", millis() / 1000.0f, GROQ_API_HOST);
+            isNetworkError = true;
+            return "";
+        }
+    } else {
+        Serial.printf("[%6.2fs][GROQ] Dùng kênh SSL Pre-connected sẵn sàng (0ms chờ kết nối)!\n", millis() / 1000.0f);
     }
 
-    // 1. Tạo WAV từ PCM (căn lề chia hết cho 3 chuẩn xác)
-    uint32_t useSamples = (uint32_t)recordSamples;
-    size_t rawPcmBytes = (size_t)useSamples * sizeof(int16_t);
-    size_t pcmBytes = (rawPcmBytes / 3) * 3;
-    size_t wavSize = WAV_HEADER_SIZE + pcmBytes;
-
-    while (wavSize % 3 != 0) {
-        pcmBytes -= 2;
-        wavSize = WAV_HEADER_SIZE + pcmBytes;
+    WiFiClientSecure &client = groqSttClient;
+    if (client.connected()) {
+        client.setNoDelay(true);
     }
 
-    uint8_t *wavBuf = (uint8_t *)ps_malloc(wavSize);
-    if (!wavBuf) {
-        Serial.println("[NET] LỖI: Cấp phát PSRAM lưu WAV thất bại!");
-        client.stop();
-        return "";
-    }
-    create_wav_header(wavBuf, pcmBytes, AI_AUDIO_SAMPLE_RATE, 1, 16);
-    memcpy(wavBuf + WAV_HEADER_SIZE, (const uint8_t *)recordBuf, pcmBytes);
+    static const char *kBoundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
 
-    // 2. Mã hóa Base64 Audio & Ảnh
-    uint8_t *audB64 = NULL; size_t audB64Len = 0;
-    uint8_t *imgB64 = NULL; size_t imgB64Len = 0;
+    String partModel = String("--") + kBoundary + "\r\n"
+                     + "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+                     + GROQ_MODEL + "\r\n";
 
-    if (!base64_encode(wavBuf, wavSize, &audB64, &audB64Len)) {
-        Serial.println("[NET] LỖI: Mã hóa Base64 audio thất bại!");
-        free(wavBuf); client.stop();
-        return "";
-    }
-    free(wavBuf);
+    String partLang = String("--") + kBoundary + "\r\n"
+                    + "Content-Disposition: form-data; name=\"language\"\r\n\r\n"
+                    + "vi\r\n";
 
-    if (!base64_encode(jpegBuf, jpegSize, &imgB64, &imgB64Len)) {
-        Serial.println("[NET] LỖI: Mã hóa Base64 ảnh thất bại!");
-        free(audB64); client.stop();
-        return "";
-    }
+    String partFormat = String("--") + kBoundary + "\r\n"
+                      + "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n"
+                      + "json\r\n";
 
-    // 3. Đóng gói JSON: Text chỉ thị trực tiếp (Part 0) -> Audio WAV (Part 1) -> Ảnh JPEG (Part 2)
-    String promptText = "Bạn là trợ lý AI cho người khiếm thị. Người dùng đang nói câu hỏi trong file audio đính kèm ngay sau đây. "
-                        "Hãy lắng nghe kỹ audio và trả lời đúng trọng tâm câu hỏi đó bằng tiếng Việt (dưới 25 từ). "
-                        "Nếu câu hỏi liên quan đến đồ vật trước mặt thì hãy nhìn bức ảnh đính kèm để trả lời. "
-                        "Chỉ khi nào trong audio hoàn toàn im lặng không có tiếng người nói thì bạn mới mô tả bức ảnh.";
+    String partTemp = String("--") + kBoundary + "\r\n"
+                    + "Content-Disposition: form-data; name=\"temperature\"\r\n\r\n"
+                    + "0.0\r\n";
 
-    String jsonHeader = "{\"contents\":[{\"parts\":["
-                        "{\"text\":\"" + promptText + "\"},"
-                        "{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
-    String jsonMid    = "\"}},{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
-    String jsonFooter = "\"}}]}]}";
+    String partFileHeader = String("--") + kBoundary + "\r\n"
+                          + "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n"
+                          + "Content-Type: audio/wav\r\n\r\n";
 
-    size_t totalContentLength = jsonHeader.length() + audB64Len +
-                                jsonMid.length() + imgB64Len + jsonFooter.length();
+    String partFooter = String("\r\n--") + kBoundary + "--\r\n";
 
-    String urlPath = String("/v1beta/models/") + GEMINI_MODEL_SHORT +
-                     ":streamGenerateContent?alt=sse&key=" + cached_api_key;
+    size_t totalBodyLen = partModel.length() + partLang.length() + partFormat.length()
+                        + partTemp.length() + partFileHeader.length() + wavSize + partFooter.length();
 
-    // 4. Gửi HTTP headers
-    client.printf("POST %s HTTP/1.1\r\n", urlPath.c_str());
-    client.printf("Host: %s\r\n", GEMINI_API_HOST);
-    client.printf("Content-Type: application/json\r\n");
-    client.printf("Content-Length: %zu\r\n", totalContentLength);
+    // Gửi HTTP POST Headers
+    client.printf("POST /openai/v1/audio/transcriptions HTTP/1.1\r\n");
+    client.printf("Host: %s\r\n", GROQ_API_HOST);
+    client.printf("Authorization: Bearer %s\r\n", GROQ_API_KEY);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", kBoundary);
+    client.printf("Content-Length: %zu\r\n", totalBodyLen);
     client.printf("Connection: close\r\n\r\n");
 
-    // 5. Stream JSON body: Header + Audio + Mid + Ảnh + Footer
-    Serial.printf("[NET] Stream Audio(%u) + Ảnh(%u) lên Gemini...\n",
-                  (unsigned)audB64Len, (unsigned)imgB64Len);
-
-    bool streamOk = (client.print(jsonHeader) > 0);
-    streamOk = streamOk && stream_to_client(client, audB64, audB64Len);
-    streamOk = streamOk && (client.print(jsonMid) > 0);
-    streamOk = streamOk && stream_to_client(client, imgB64, imgB64Len);
-    streamOk = streamOk && (client.print(jsonFooter) > 0);
-    client.flush();
-
-    free(imgB64);
-    free(audB64);
-    imgB64 = NULL; audB64 = NULL;
-
-    if (!streamOk) {
-        Serial.println("[NET] Lỗi ghi Socket SSL!");
-        client.stop();
-        return "";
+    // Gửi Multipart Body
+    client.print(partModel);
+    client.print(partLang);
+    client.print(partFormat);
+    client.print(partTemp);
+    client.print(partFileHeader);
+    
+    // Stream file WAV nhị phân siêu tốc (chunk 2KB tối ưu cho TLS buffer của ESP32)
+    size_t offset = 0;
+    while (offset < wavSize && client.connected() && pipelineBusy) {
+        size_t toWrite = (wavSize - offset > 2048) ? 2048 : (wavSize - offset);
+        size_t n = client.write(wavBuf + offset, toWrite);
+        if (n > 0) {
+            offset += n;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 
-    // 6. Nhận phản hồi từ Gemini & Đẩy ngay vào TTS Queue
-    client.setTimeout(10);
+    if (offset != wavSize) {
+        Serial.printf("[%6.2fs][GROQ] Lỗi stream WAV lên Groq (gửi %zu/%zu bytes)!\n",
+                      millis() / 1000.0f, offset, wavSize);
+        client.stop();
+        isNetworkError = true;
+        return "";
+    }
+    client.print(partFooter);
+    client.flush();
+
+    Serial.printf("[%6.2fs][GROQ] Đã gửi WAV (%u bytes). Đang chờ Groq LPU giải mã...\n",
+                  millis() / 1000.0f, (unsigned)wavSize);
+
+    // Đọc phản hồi JSON từ Groq
     unsigned long startWait = millis();
-    while (!client.available() && (millis() - startWait < 15000)) {
+    while (!client.available() && (millis() - startWait < 8000)) {
         if (!pipelineBusy) { client.stop(); return ""; }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+
     if (!client.available()) {
-        Serial.println("[NET] Hết thời gian chờ phản hồi từ AI!");
+        Serial.printf("[%6.2fs][GROQ] Timeout phản hồi từ Groq!\n", millis() / 1000.0f);
+        client.stop();
+        isNetworkError = true;
+        return "";
+    }
+
+    bool inHeader = true;
+    String transcribedText = "";
+    char lineBuf[512];
+
+    while (client.connected() || client.available()) {
+        if (client.available()) {
+            size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
+            if (n == 0) continue;
+            lineBuf[n] = '\0';
+
+            while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
+                lineBuf[--n] = '\0';
+            }
+
+            if (inHeader) {
+                if (n == 0) inHeader = false;
+                continue;
+            }
+
+            // Trích xuất trường "text": "..."
+            char *textKey = strstr(lineBuf, "\"text\":");
+            if (textKey) {
+                char *valStart = strchr(textKey + 7, '\"');
+                if (valStart) {
+                    valStart++;
+                    char *p = valStart;
+                    while (*p) {
+                        if (*p == '\\' && *(p+1)) {
+                            p++;
+                            if (*p == 'n') transcribedText += '\n';
+                            else if (*p == '\"') transcribedText += '\"';
+                            else if (*p == '\\') transcribedText += '\\';
+                            else transcribedText += *p;
+                        } else if (*p == '\"') {
+                            break;
+                        } else {
+                            transcribedText += *p;
+                        }
+                        p++;
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+
+    client.stop();
+    transcribedText.trim();
+    return transcribedText;
+}
+
+// ============================================================
+// Core 0: Gửi Audio WAV lên Deepgram Nova STT (Tầng 2 STT Fallback)
+// ============================================================
+static String deepgram_transcribe(const uint8_t *wavBuf, size_t wavSize, bool &isNetworkError) {
+    isNetworkError = false;
+    if (strlen(DEEPGRAM_API_KEY) == 0 || wavBuf == NULL || wavSize <= WAV_HEADER_SIZE) return "";
+
+    Serial.printf("[%6.2fs][DEEPGRAM] Đang kết nối tới Deepgram Nova STT (%s)...\n",
+                  millis() / 1000.0f, DEEPGRAM_MODEL);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(3);
+    client.setTimeout(4000);
+
+    if (!client.connect(DEEPGRAM_API_HOST, DEEPGRAM_API_PORT)) {
+        Serial.printf("[%6.2fs][DEEPGRAM] Không thể kết nối SSL tới Deepgram!\n", millis() / 1000.0f);
+        isNetworkError = true;
+        return "";
+    }
+
+    String urlPath = String("/v1/listen?model=") + DEEPGRAM_MODEL + "&language=vi&smart_format=true&punctuate=true&numerals=true";
+
+    client.printf("POST %s HTTP/1.1\r\n", urlPath.c_str());
+    client.printf("Host: %s\r\n", DEEPGRAM_API_HOST);
+    client.printf("Authorization: Token %s\r\n", DEEPGRAM_API_KEY);
+    client.printf("Content-Type: audio/wav\r\n");
+    client.printf("Content-Length: %zu\r\n", wavSize);
+    client.printf("Connection: close\r\n\r\n");
+
+    if (!stream_to_client(client, wavBuf, wavSize)) {
+        Serial.printf("[%6.2fs][DEEPGRAM] Lỗi gửi WAV tới Deepgram!\n", millis() / 1000.0f);
+        client.stop();
+        isNetworkError = true;
+        return "";
+    }
+    client.flush();
+
+    Serial.printf("[%6.2fs][DEEPGRAM] Đã gửi WAV (%zu bytes). Đang chờ Deepgram giải mã...\n",
+                  millis() / 1000.0f, wavSize);
+
+    unsigned long startWait = millis();
+    while (!client.available() && (millis() - startWait < 6000)) {
+        if (!pipelineBusy) { client.stop(); return ""; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!client.available()) {
+        Serial.printf("[%6.2fs][DEEPGRAM] Timeout (6s) phản hồi từ Deepgram!\n", millis() / 1000.0f);
+        client.stop();
+        isNetworkError = true;
+        return "";
+    }
+
+    String transcribedText = "";
+    String accum = "";
+    int httpStatus = 0;
+    bool inHeader = true;
+    char lineBuf[256];
+
+    // Đọc toàn bộ response với timeout tổng tối đa 6 giây (CỰC KỲ AN TOÀN, KHÔNG BAO GIỜ TREO)
+    unsigned long readDeadline = millis() + 6000;
+    while ((client.connected() || client.available()) && (millis() < readDeadline) && pipelineBusy) {
+        if (client.available()) {
+            if (inHeader) {
+                size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
+                if (n == 0) continue;
+                lineBuf[n] = '\0';
+                while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
+                    lineBuf[--n] = '\0';
+                }
+                if (strncmp(lineBuf, "HTTP/1.", 7) == 0) {
+                    if (strstr(lineBuf, " 200 ")) httpStatus = 200;
+                    else httpStatus = 400;
+                }
+                if (n == 0) {
+                    inHeader = false; // Hết Header!
+                }
+            } else {
+                // Đọc Body
+                char c = (char)client.read();
+                accum += c;
+                int tIdx = accum.indexOf("\"transcript\":\"");
+                if (tIdx >= 0) {
+                    int startPos = tIdx + 14;
+                    int endPos = accum.indexOf('\"', startPos);
+                    if (endPos >= 0) {
+                        transcribedText = accum.substring(startPos, endPos);
+                        break; // ĐÃ LẤY XONG TRANSCRIPT! THOÁT NGAY!
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+
+    client.stop();
+    transcribedText.trim();
+    if (httpStatus != 200 && httpStatus != 0) {
+        isNetworkError = true;
+    }
+    return transcribedText;
+}
+
+static String escape_json_str(const String &src) {
+    String out = "";
+    out.reserve(src.length() + 16);
+    for (size_t i = 0; i < src.length(); i++) {
+        char c = src.charAt(i);
+        if (c == '\"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') {}
+        else if (c == '\t') out += "\\t";
+        else out += c;
+    }
+    return out;
+}
+
+// ============================================================
+// Core 0: Gửi câu hỏi Text + Ảnh lên Groq Vision API (Qwen 3.8/3.6)
+// ============================================================
+static String ask_groq_vision(const char *modelName, const String &promptText,
+                              const uint8_t *imgB64, size_t imgB64Len, bool &isRateLimit) {
+    isRateLimit = false;
+    if (strlen(GROQ_API_KEY) == 0) {
+        Serial.printf("[%6.2fs][NET] Bỏ qua Groq Vision — Chưa có GROQ_API_KEY!\n", millis() / 1000.0f);
+        return "";
+    }
+
+    Serial.printf("[%6.2fs][NET] Đang kết nối tới Groq Vision [Model: %s]...\n",
+                  millis() / 1000.0f, modelName);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(4);
+    client.setTimeout(10000);
+
+    if (!client.connect(GROQ_API_HOST, GROQ_API_PORT)) {
+        Serial.printf("[%6.2fs][NET] Không thể kết nối SSL tới Groq Vision!\n", millis() / 1000.0f);
+        return "";
+    }
+    client.setNoDelay(true);
+
+    bool useMultiTurn = (isFollowUpSession && lastGroqUserPrompt.length() > 0 && lastSavedImgB64 && lastSavedImgB64Len > 0);
+
+    String safePrompt = escape_json_str(promptText);
+    String jsonPart1 = "";
+    String jsonPart2 = "";
+    size_t totalLen = 0;
+
+    if (useMultiTurn) {
+        // Gửi Multi-turn: Lượt 1 (Ảnh cũ + Prompt cũ) -> AI Reply cũ -> Lượt 2 (Prompt mới)
+        String safeOldPrompt = escape_json_str(lastGroqUserPrompt);
+        String safeOldReply  = escape_json_str(lastGroqAiReply);
+
+        jsonPart1 = "{\"model\":\"" + String(modelName) + "\",\"messages\":["
+                    "{\"role\":\"user\",\"content\":["
+                    "{\"type\":\"text\",\"text\":\"" + safeOldPrompt + "\"},"
+                    "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
+
+        jsonPart2 = "\"}}]},"
+                    "{\"role\":\"assistant\",\"content\":\"" + safeOldReply + "\"},"
+                    "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"" + safePrompt + "\"}]}"
+                    "],\"temperature\":0.3,\"top_p\":0.95,\"reasoning_effort\":\"none\",\"max_completion_tokens\":300,\"stream\":true}";
+
+        totalLen = jsonPart1.length() + lastSavedImgB64Len + jsonPart2.length();
+        Serial.printf("[%6.2fs][GROQ] >>> NỐI TIẾP HỘI THOẠI (Gửi Ngữ Cảnh + Ảnh Cũ Lên Groq Vision)... <<<\n", millis() / 1000.0f);
+    } else {
+        // Single Turn thông thường
+        jsonPart1 = "{\"model\":\"" + String(modelName) + "\",\"messages\":[{\"role\":\"user\",\"content\":["
+                    "{\"type\":\"text\",\"text\":\"" + safePrompt + "\"},"
+                    "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
+        jsonPart2 = "\"}}]}],\"temperature\":0.3,\"top_p\":0.95,\"reasoning_effort\":\"none\",\"max_completion_tokens\":300,\"stream\":true}";
+        totalLen = jsonPart1.length() + imgB64Len + jsonPart2.length();
+    }
+
+    client.printf("POST /openai/v1/chat/completions HTTP/1.1\r\n");
+    client.printf("Host: %s\r\n", GROQ_API_HOST);
+    client.printf("Authorization: Bearer %s\r\n", GROQ_API_KEY);
+    client.printf("Content-Type: application/json\r\n");
+    client.printf("Content-Length: %zu\r\n", totalLen);
+    client.printf("Connection: close\r\n\r\n");
+
+    Serial.printf("[%6.2fs][NET] Gửi câu hỏi Text %s lên Groq Vision [%s]...\n",
+                  millis() / 1000.0f, useMultiTurn ? "(Dùng lại ảnh cũ)" : "+ Ảnh", modelName);
+
+    bool streamOk = (client.print(jsonPart1) > 0);
+    if (useMultiTurn) {
+        streamOk = streamOk && stream_to_client(client, lastSavedImgB64, lastSavedImgB64Len);
+    } else {
+        streamOk = streamOk && stream_to_client(client, imgB64, imgB64Len);
+    }
+    streamOk = streamOk && (client.print(jsonPart2) > 0);
+    client.flush();
+
+    if (!streamOk) {
+        Serial.printf("[%6.2fs][NET] Lỗi ghi socket Groq Vision!\n", millis() / 1000.0f);
+        client.stop();
+        return "";
+    }
+
+    unsigned long startWait = millis();
+    while (!client.available() && (millis() - startWait < 10000)) {
+        if (!pipelineBusy) { client.stop(); return ""; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!client.available()) {
+        Serial.printf("[%6.2fs][NET] Hết thời gian chờ phản hồi (10s) từ Groq Vision!\n", millis() / 1000.0f);
         client.stop();
         return "";
     }
@@ -661,62 +1157,462 @@ static String send_audio_image_to_gemini(void) {
     ttsSentenceBuf = "";
     String fullReply = "";
     bool inHeader = true;
-    startWait = millis();
+    bool inThinking = false;
+    unsigned long lastDataTime = millis();
+    unsigned long totalDeadline = millis() + 25000;
     int httpStatus = 0;
-
     char lineBuf[512];
 
-    while ((client.connected() || client.available()) && (millis() - startWait < 25000)) {
+    while ((client.connected() || client.available()) && (millis() - lastDataTime < 4000) && (millis() < totalDeadline)) {
         if (!pipelineBusy) break;
 
         if (client.available()) {
             size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
             if (n == 0) continue;
             lineBuf[n] = '\0';
-            startWait = millis();
+            lastDataTime = millis();
 
-            // Xóa \r ở cuối dòng
             while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
                 lineBuf[--n] = '\0';
             }
 
             if (inHeader) {
                 if (strncmp(lineBuf, "HTTP/1.", 7) == 0) {
-                    Serial.printf("[NET] %s\n", lineBuf);
+                    Serial.printf("[%6.2fs][NET] %s\n", millis() / 1000.0f, lineBuf);
                     if (strstr(lineBuf, " 200 ")) httpStatus = 200;
+                    else if (strstr(lineBuf, " 429 ")) { httpStatus = 429; isRateLimit = true; }
                     else httpStatus = 400;
                 }
                 if (n == 0) {
                     inHeader = false;
                     if (httpStatus == 200) {
-                        Serial.print("[NET] AI Trả lời: ");
-                    } else {
-                        Serial.println("[NET] Lỗi từ máy chủ Google:");
+                        Serial.printf("[%6.2fs][NET] AI Trả lời [Groq %s]: ", millis() / 1000.0f, modelName);
                     }
                 }
                 continue;
             }
 
             if (httpStatus != 200) {
-                // In ra toàn bộ nội dung lỗi của Google để chẩn đoán
+                if (strstr(lineBuf, "rate_limit_exceeded") || strstr(lineBuf, "Rate limit")) {
+                    isRateLimit = true;
+                }
                 Serial.println(lineBuf);
                 continue;
             }
 
-            // Xử lý SSE stream khi HTTP 200 OK
             char *jsonPayload = lineBuf;
-            if (strncmp(lineBuf, "data: ", 6) == 0) {
-                jsonPayload = lineBuf + 6;
-            }
+            if (strncmp(lineBuf, "data: ", 6) == 0) jsonPayload = lineBuf + 6;
             while (*jsonPayload == ' ') jsonPayload++;
             if (strcmp(jsonPayload, "[DONE]") == 0) break;
 
-            // Trích xuất "text":"..." siêu tốc
+            char *contentKey = strstr(jsonPayload, "\"content\":");
+            if (contentKey) {
+                char *valStart = strchr(contentKey + 10, '\"');
+                if (valStart) {
+                    valStart++;
+                    char *p = valStart;
+                    String piece = "";
+                    while (*p) {
+                        if (*p == '\\' && *(p+1)) {
+                            p++;
+                            if (*p == 'n') piece += '\n';
+                            else if (*p == 'r') piece += '\r';
+                            else if (*p == 't') piece += '\t';
+                            else if (*p == '\"') piece += '\"';
+                            else if (*p == '\\') piece += '\\';
+                            else if (*p == 'u' && isxdigit(*(p+1)) && isxdigit(*(p+2)) && isxdigit(*(p+3)) && isxdigit(*(p+4))) {
+                                char hex[5] = { *(p+1), *(p+2), *(p+3), *(p+4), 0 };
+                                long code = strtol(hex, NULL, 16);
+                                p += 4;
+                                if (code == 0x3c) piece += '<';
+                                else if (code == 0x3e) piece += '>';
+                                else if (code < 128) piece += (char)code;
+                            } else piece += *p;
+                        } else if (*p == '\"') {
+                            break;
+                        } else {
+                            piece += *p;
+                        }
+                        p++;
+                    }
+
+                    if (!inThinking) {
+                        if (piece.indexOf("<think") >= 0 || piece.indexOf("u003cthink") >= 0 || piece.indexOf("think>") >= 0) {
+                            inThinking = true;
+                        }
+                    }
+
+                    if (inThinking) {
+                        int closeIdx = piece.indexOf("</think>");
+                        if (closeIdx < 0) closeIdx = piece.indexOf("u003c/think");
+                        if (closeIdx < 0) closeIdx = piece.indexOf("</think");
+                        if (closeIdx < 0) closeIdx = piece.indexOf("think>");
+
+                        if (closeIdx >= 0) {
+                            inThinking = false;
+                            int endTag = piece.indexOf('>', closeIdx);
+                            if (endTag >= 0) {
+                                piece = piece.substring(endTag + 1);
+                            } else {
+                                piece = "";
+                            }
+                        } else {
+                            piece = "";
+                        }
+                    }
+
+                    if (!inThinking && piece.length() > 0) {
+                        tone_driver_waiting_music_set(false);
+                        Serial.print(piece);
+                        fullReply += piece;
+                        ttsSentenceBuf += piece;
+                        flush_sentences();
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+    }
+
+    tone_driver_waiting_music_set(false);
+    Serial.println();
+    client.stop();
+
+    if (httpStatus == 200 && fullReply.length() > 0) {
+        flush_remaining();
+    }
+    return fullReply;
+}
+
+static String ask_gemini_interactions(const char *currentModel, const String &promptText,
+                                     const uint8_t *imgB64, size_t imgB64Len, bool &isContextExpired) {
+    isContextExpired = false;
+    bool hasPrevious = (lastInteractionId.length() > 0);
+    if (hasPrevious) {
+        Serial.printf("[%6.2fs][INTERACTIONS] >>> Nối tiếp hội thoại (Previous ID: %s)... <<<\n",
+                      millis() / 1000.0f, lastInteractionId.c_str());
+    } else {
+        Serial.printf("[%6.2fs][INTERACTIONS] >>> Bắt đầu phiên hội thoại mới [Model: %s]... <<<\n",
+                      millis() / 1000.0f, currentModel);
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(4);
+    client.setTimeout(10000);
+
+    if (WiFi.status() != WL_CONNECTED) {
+        ensure_wifi();
+    }
+
+    if (!client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
+        Serial.printf("[%6.2fs][INTERACTIONS] Không thể kết nối SSL tới Gemini Interactions!\n", millis() / 1000.0f);
+        lastInteractionId = "";
+        return "";
+    }
+
+    // 2. Xây dựng JSON Request Payload cho Google Interactions API
+    // Schema chuẩn: {"model":"...","input":[{"type":"user_input","content":"..."},{"type":"image","data":"...","mime_type":"image/jpeg"}],"previous_interaction_id":"..."}
+    // Gửi CẢ ảnh chụp mới VÀ previous_interaction_id để Google tích lũy toàn bộ ảnh trong session!
+    bool sendImageNow = (imgB64 && imgB64Len > 0);
+
+    String jsonHeader = "{\"model\":\"" + String(currentModel) + "\",\"input\":[{\"type\":\"user_input\",\"content\":\"" + promptText + "\"}";
+    String jsonImage = "";
+    if (sendImageNow) {
+        jsonImage = ",{\"type\":\"image\",\"data\":\"";
+    }
+    String jsonFooter = "";
+    if (sendImageNow) {
+        jsonFooter = "\",\"mime_type\":\"image/jpeg\"}";
+    }
+    jsonFooter += "]";
+    if (hasPrevious) {
+        jsonFooter += ",\"previous_interaction_id\":\"" + lastInteractionId + "\"";
+    }
+    jsonFooter += ",\"stream\":true";
+    jsonFooter += "}";
+
+    size_t totalContentLength = jsonHeader.length() + jsonImage.length() + (sendImageNow ? imgB64Len : 0) + jsonFooter.length();
+
+    String urlPath = String("/v1beta/interactions?key=") + cached_api_key;
+
+    client.setNoDelay(true);
+    client.printf("POST %s HTTP/1.1\r\n", urlPath.c_str());
+    client.printf("Host: %s\r\n", GEMINI_API_HOST);
+    client.printf("Content-Type: application/json\r\n");
+    client.printf("Accept: text/event-stream\r\n");
+    client.printf("Accept-Encoding: identity\r\n");
+    client.printf("Content-Length: %zu\r\n", totalContentLength);
+    client.printf("Connection: close\r\n\r\n");
+
+    Serial.printf("[%6.2fs][INTERACTIONS] Gửi câu hỏi Text %s lên Gemini [%s] (Real-time SSE Stream)...\n",
+                  millis() / 1000.0f, sendImageNow ? "+ Ảnh mới" : "", currentModel);
+
+    bool streamOk = (client.print(jsonHeader) > 0);
+    if (sendImageNow) {
+        streamOk = streamOk && (client.print(jsonImage) > 0);
+        streamOk = streamOk && stream_to_client(client, imgB64, imgB64Len);
+    }
+    streamOk = streamOk && (client.print(jsonFooter) > 0);
+    client.flush();
+
+    if (!streamOk) {
+        Serial.printf("[%6.2fs][INTERACTIONS] Lỗi ghi Socket SSL!\n", millis() / 1000.0f);
+        client.stop();
+        lastInteractionId = "";
+        return "";
+    }
+
+    unsigned long startWait = millis();
+    while (!client.available() && (millis() - startWait < 10000)) {
+        if (!pipelineBusy) { client.stop(); break; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!client.available()) {
+        Serial.printf("[%6.2fs][INTERACTIONS] Hết thời gian chờ (10s) -> Nhảy thẳng sang Groq Vision!\n", millis() / 1000.0f);
+        client.stop();
+        lastInteractionId = "";
+        return "";
+    }
+
+    ttsSentenceBuf = "";
+    String fullReply = "";
+    int httpStatus = 0;
+    char lineBuf[512];
+    bool inHeader = true;
+    unsigned long lastDataTime = millis();
+    unsigned long totalDeadline = millis() + 25000; // Hạn chót tổng tối đa 25 giây cho toàn bộ câu trả lời
+    String newInteractionId = "";
+
+    // Đọc Headers & Body với Time Limit
+    while ((client.connected() || client.available()) && (millis() - lastDataTime < 4000) && (millis() < totalDeadline)) {
+        if (!pipelineBusy) break;
+
+        if (client.available()) {
+            size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
+            if (n == 0) continue;
+            lineBuf[n] = '\0';
+            lastDataTime = millis();
+
+            while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
+                lineBuf[--n] = '\0';
+            }
+
+            if (inHeader) {
+                if (strncmp(lineBuf, "HTTP/1.", 7) == 0) {
+                    Serial.printf("[%6.2fs][INTERACTIONS] %s\n", millis() / 1000.0f, lineBuf);
+                    if (strstr(lineBuf, " 200 ")) httpStatus = 200;
+                    else httpStatus = 400;
+                }
+                if (n == 0) {
+                    inHeader = false;
+                    if (httpStatus == 200) {
+                        Serial.printf("[%6.2fs][INTERACTIONS] AI Trả lời [%s]: ", millis() / 1000.0f, currentModel);
+                    }
+                }
+                continue;
+            }
+
+            if (httpStatus != 200) {
+                Serial.println(lineBuf);
+                if (strstr(lineBuf, "not found") || strstr(lineBuf, "NOT_FOUND") ||
+                    strstr(lineBuf, "INVALID_ARGUMENT") || strstr(lineBuf, "expired") ||
+                    strstr(lineBuf, "context") || strstr(lineBuf, "RESOURCE_EXHAUSTED") ||
+                    strstr(lineBuf, "interaction")) {
+                    isContextExpired = true;
+                    lastInteractionId = "";
+                }
+                continue;
+            }
+
+            // Trích xuất "id":"..." từ JSON trả về
+            char *idKey = strstr(lineBuf, "\"id\":\"");
+            if (idKey && newInteractionId.length() == 0) {
+                char *idStart = idKey + 6;
+                char *idEnd = strchr(idStart, '\"');
+                if (idEnd) {
+                    newInteractionId = String(idStart).substring(0, idEnd - idStart);
+                }
+            }
+
+            // Khi nhận được tín hiệu kết thúc stream -> ngắt đọc ngay lập tức
+            if (strstr(lineBuf, "[DONE]") || strstr(lineBuf, "interaction.completed")) {
+                break;
+            }
+
+            // Trích xuất Text trong model_output hoặc step.delta streaming
+            char *textKey = strstr(lineBuf, "\"type\":\"model_output\"");
+            if (!textKey) textKey = strstr(lineBuf, "\"text\":");
+            if (textKey) {
+                char *actualTextKey = strstr(lineBuf, "\"text\":\"");
+                if (actualTextKey) {
+                    char *valStart = actualTextKey + 8;
+                    char *p = valStart;
+                    String chunkText = "";
+                    while (*p && *p != '\"') {
+                        if (*p == '\\' && *(p+1)) {
+                            p++;
+                            if (*p == 'n') chunkText += '\n';
+                            else if (*p == '\"') chunkText += '\"';
+                            else if (*p == 'r') {}
+                            else if (*p == 't') chunkText += '\t';
+                            else chunkText += *p;
+                        } else {
+                            chunkText += *p;
+                        }
+                        p++;
+                    }
+
+                    if (chunkText.length() > 0) {
+                        tone_driver_waiting_music_set(false);
+                        Serial.print(chunkText);
+                        fullReply += chunkText;
+                        ttsSentenceBuf += chunkText;
+                        flush_sentences();
+                    }
+                }
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+    }
+
+    tone_driver_waiting_music_set(false);
+    client.stop();
+
+    if (newInteractionId.length() > 0) {
+        lastInteractionId = newInteractionId;
+        lastInteractionMs = millis();
+        Serial.printf("\n[%6.2fs][INTERACTIONS] Đã lưu Session ID: %s\n",
+                      millis() / 1000.0f, lastInteractionId.c_str());
+    }
+
+    if (httpStatus == 200 && fullReply.length() > 0) {
+        flush_remaining();
+    }
+
+    return fullReply;
+}
+
+// ============================================================
+// Core 0: Gửi Prompt + Ảnh JPEG lên Gemini (3.5 hoặc 3.1)
+// ============================================================
+static String ask_gemini_vision(const char *currentModel, const String &promptText, const uint8_t *imgB64, size_t imgB64Len) {
+    Serial.printf("[%6.2fs][NET] Đang kết nối tới Gemini API [Model: %s]...\n",
+                  millis() / 1000.0f, currentModel);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(4);
+    client.setTimeout(10000);
+
+    if (WiFi.status() != WL_CONNECTED) {
+        ensure_wifi();
+    }
+
+    if (!client.connect(GEMINI_API_HOST, GEMINI_API_PORT)) {
+        Serial.printf("[%6.2fs][NET] Không thể kết nối SSL tới Gemini [%s]! Nhảy thẳng sang model khác...\n",
+                      millis() / 1000.0f, currentModel);
+        return "";
+    }
+
+    String jsonHeader = "{\"contents\":[{\"parts\":["
+                        "{\"text\":\"" + promptText + "\"},"
+                        "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
+    String jsonFooter = "\"}}]}],\"generationConfig\":{\"temperature\":0.3}}";
+
+    size_t totalContentLength = jsonHeader.length() + imgB64Len + jsonFooter.length();
+
+    String urlPath = String("/v1beta/models/") + currentModel +
+                     ":streamGenerateContent?alt=sse&key=" + cached_api_key;
+
+    client.printf("POST %s HTTP/1.1\r\n", urlPath.c_str());
+    client.printf("Host: %s\r\n", GEMINI_API_HOST);
+    client.printf("Content-Type: application/json\r\n");
+    client.printf("Content-Length: %zu\r\n", totalContentLength);
+    client.printf("Connection: close\r\n\r\n");
+
+    Serial.printf("[%6.2fs][NET] Gửi câu hỏi Text + Ảnh(%u bytes) lên Gemini [%s]...\n",
+                  millis() / 1000.0f, (unsigned)imgB64Len, currentModel);
+
+    bool streamOk = (client.print(jsonHeader) > 0);
+    streamOk = streamOk && stream_to_client(client, imgB64, imgB64Len);
+    streamOk = streamOk && (client.print(jsonFooter) > 0);
+    client.flush();
+
+    if (!streamOk) {
+        Serial.printf("[%6.2fs][NET] Lỗi ghi Socket SSL với model %s!\n", millis() / 1000.0f, currentModel);
+        client.stop();
+        return "";
+    }
+
+    unsigned long startWait = millis();
+    while (!client.available() && (millis() - startWait < 15000)) {
+        if (!pipelineBusy) { client.stop(); break; }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (!client.available()) {
+        Serial.printf("[%6.2fs][NET] Hết thời gian chờ phản hồi từ model %s!\n",
+                      millis() / 1000.0f, currentModel);
+        client.stop();
+        return "";
+    }
+
+    ttsSentenceBuf = "";
+    String fullReply = "";
+    bool inHeader = true;
+    unsigned long lastDataTime = millis();
+    int httpStatus = 0;
+    char lineBuf[512];
+
+    while ((client.connected() || client.available()) && (millis() - lastDataTime < 6000)) {
+        if (!pipelineBusy) break;
+
+        if (client.available()) {
+            size_t n = client.readBytesUntil('\n', (uint8_t *)lineBuf, sizeof(lineBuf) - 1);
+            if (n == 0) continue;
+            lineBuf[n] = '\0';
+            lastDataTime = millis();
+
+            while (n > 0 && (lineBuf[n-1] == '\r' || lineBuf[n-1] == ' ' || lineBuf[n-1] == '\t')) {
+                lineBuf[--n] = '\0';
+            }
+
+            if (inHeader) {
+                if (strncmp(lineBuf, "HTTP/1.", 7) == 0) {
+                    Serial.printf("[%6.2fs][NET] %s\n", millis() / 1000.0f, lineBuf);
+                    if (strstr(lineBuf, " 200 ")) httpStatus = 200;
+                    else httpStatus = 400;
+                }
+                if (n == 0) {
+                    inHeader = false;
+                    if (httpStatus == 200) {
+                        Serial.printf("[%6.2fs][NET] AI Trả lời [%s]: ", millis() / 1000.0f, currentModel);
+                    } else {
+                        Serial.printf("[%6.2fs][NET] Lỗi từ model %s:\n", millis() / 1000.0f, currentModel);
+                    }
+                }
+                continue;
+            }
+
+            if (httpStatus != 200) {
+                Serial.println(lineBuf);
+                continue;
+            }
+
+            char *jsonPayload = lineBuf;
+            if (strncmp(lineBuf, "data: ", 6) == 0) jsonPayload = lineBuf + 6;
+            while (*jsonPayload == ' ') jsonPayload++;
+            if (strcmp(jsonPayload, "[DONE]") == 0) break;
+
             char *textKey = strstr(jsonPayload, "\"text\":");
             if (textKey) {
                 char *valStart = strchr(textKey + 7, '\"');
                 if (valStart) {
-                    valStart++; // Bỏ dấu " mở
+                    valStart++;
                     char *p = valStart;
                     String piece = "";
                     while (*p) {
@@ -737,23 +1633,187 @@ static String send_audio_image_to_gemini(void) {
                     }
 
                     if (piece.length() > 0) {
+                        tone_driver_waiting_music_set(false);
                         Serial.print(piece);
                         fullReply += piece;
                         ttsSentenceBuf += piece;
-                        flush_sentences(); // Bắn ngay sang TTS phát ra loa!
+                        flush_sentences();
                     }
                 }
             }
+
+            if (strstr(jsonPayload, "\"finishReason\"")) {
+                break;
+            }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
 
+    tone_driver_waiting_music_set(false);
     Serial.println();
     client.stop();
 
-    // Phát nốt phần còn lại của câu cuối cùng
-    flush_remaining();
+    if (httpStatus == 200 && fullReply.length() > 0) {
+        flush_remaining();
+    }
+    return fullReply;
+}
+
+// ============================================================
+// Core 0: Gửi ảnh JPEG + câu hỏi Text tới AI (Gemini / Groq Vision)
+// ============================================================
+static String send_audio_image_to_gemini(void) {
+    if (cached_api_key.length() == 0 && strlen(GROQ_API_KEY) == 0) {
+        Serial.printf("[%6.2fs][AI] CHƯA CÓ API KEY!\n", millis() / 1000.0f);
+        return "";
+    }
+    if (jpegBuf == NULL || jpegSize == 0) {
+        Serial.printf("[%6.2fs][AI] Chưa có ảnh để gửi!\n", millis() / 1000.0f);
+        return "";
+    }
+
+    WiFi.setSleep(false);
+
+    // 1. Tạo WAV từ PCM
+    uint32_t useSamples = (uint32_t)recordSamples;
+    size_t rawPcmBytes = (size_t)useSamples * sizeof(int16_t);
+    size_t pcmBytes = (rawPcmBytes / 2) * 2;
+    size_t wavSize = WAV_HEADER_SIZE + pcmBytes;
+
+    uint8_t *wavBuf = (uint8_t *)ps_malloc(wavSize);
+    if (!wavBuf) {
+        Serial.printf("[%6.2fs][NET] LỖI: Cấp phát PSRAM lưu WAV thất bại!\n", millis() / 1000.0f);
+        return "";
+    }
+    create_wav_header(wavBuf, pcmBytes, AI_AUDIO_SAMPLE_RATE, 1, 16);
+    memcpy(wavBuf + WAV_HEADER_SIZE, (const uint8_t *)recordBuf, pcmBytes);
+
+    // 2. STT: Groq Whisper LPU (Tầng 1 Chính - 0.3s) -> Deepgram Nova-3 (Tầng 2 Dự phòng)
+    String questionText = "";
+    if (recordSamples >= 4500) {
+        bool isSttNetError = false;
+        questionText = groq_whisper_transcribe(wavBuf, wavSize, isSttNetError);
+        
+        // CHỈ KHI LỖI MẠNG / SERVER THẬT SỰ (isSttNetError == true) THÌ MỚI CHUYỂN TẦNG 2!
+        // Nếu người dùng chỉ im lặng chụp ảnh (HTTP 200, text = "") -> Không bao giờ chuyển tầng 2!
+        if (isSttNetError && strlen(DEEPGRAM_API_KEY) > 0 && pipelineBusy) {
+            Serial.printf("[%6.2fs][AI] >>> Groq STT lỗi mạng/không kết nối được -> Chuyển sang Tầng 2 (Deepgram Nova-3 STT)... <<<\n",
+                millis() / 1000.0f);
+            bool isDgNetError = false;
+            questionText = deepgram_transcribe(wavBuf, wavSize, isDgNetError);
+        }
+    }
+    free(wavBuf);
+
+    // Lọc bỏ triệt để ảo giác (Hallucination) của Whisper khi phòng im lặng
+    if (questionText.indexOf("Ghiền Mì Gõ") >= 0 ||
+        questionText.indexOf("subscribe") >= 0 ||
+        questionText.indexOf("Subscribe") >= 0 ||
+        questionText.indexOf("đăng ký kênh") >= 0 ||
+        questionText.indexOf("Cảm ơn các bạn đã theo dõi") >= 0) {
+        questionText = "";
+    }
+
+    if (questionText.length() > 0) {
+        Serial.printf("[%6.2fs][AI] >>> Giọng nói nhận diện: \"%s\" <<<\n",
+                      millis() / 1000.0f, questionText.c_str());
+    } else {
+        Serial.printf("[%6.2fs][AI] >>> Không có giọng nói trong audio (Chế độ mô tả ảnh) <<<\n",
+                      millis() / 1000.0f);
+    }
+
+    // 3. Mã hóa Base64 ảnh JPEG
+    uint8_t *imgB64 = NULL; size_t imgB64Len = 0;
+    if (!base64_encode(jpegBuf, jpegSize, &imgB64, &imgB64Len)) {
+        Serial.printf("[%6.2fs][NET] LỖI: Mã hóa Base64 ảnh thất bại!\n", millis() / 1000.0f);
+        return "";
+    }
+
+    // 4. Prompt
+    String promptText = "";
+    if (questionText.length() > 0) {
+        promptText = "Bạn là trợ lý AI Aegis Sight hỗ trợ người khiếm thị. "
+                     "Nhiệm vụ: Trả lời trực tiếp, ngắn gọn dưới 30 từ bằng tiếng Việt. "
+                     "ƯU TIÊN HÀNG ĐẦU: Luôn đối chiếu và sử dụng thông tin trong lịch sử cuộc trò chuyện (như tên người, tên vật nuôi, con số, chữ viết hoặc đồ vật vừa nói ở các lượt trước) để trả lời. "
+                     "Chỉ phân tích hình ảnh khi người dùng thực sự hỏi về quang cảnh trước mắt hoặc khi lịch sử trò chuyện chưa có câu trả lời. "
+                     "Câu hỏi: \\\"" + questionText + "\\\"";
+    } else {
+        promptText = "Bạn là trợ lý AI Aegis Sight hỗ trợ người khiếm thị. Không cần giới thiệu bản thân. "
+                     "Hãy quan sát bức ảnh và mô tả ngắn gọn đồ vật, quang cảnh hoặc chữ (nếu có) phía trước bằng tiếng Việt (dưới 35 từ).";
+    }
+
+    // ============================================================
+    // HOÁN ĐỔI THÔNG MINH 2 VÒNG:
+    // Tầng 1: Google Gemini Interactions API (gemini-3.5 <-> 3.1 với SSE Real-time Stream & Server-side Session ID)
+    // Tầng 2: Groq Vision LLM (Qwen 3.8 <-> 3.6 với Multi-turn lưu trong PSRAM)
+    // ============================================================
+    static const char *kGroqModels[] = { GROQ_VISION_MODEL_A, GROQ_VISION_MODEL_B };
+    static size_t groqModelIdx = 0;
+
+    String fullReply = "";
+
+    for (int swapRound = 1; swapRound <= 2; swapRound++) {
+        if (!pipelineBusy) break;
+
+        // 1. Thử Tầng 1: Google Gemini Interactions API (Stateful Session Memory)
+        Serial.printf("[%6.2fs][NET] >>> [Vòng %d/2] Thử Tầng 1: Google Gemini Interactions API [%s]... <<<\n",
+                      millis() / 1000.0f, swapRound, GEMINI_MODEL_PRIMARY);
+        bool isContextExpired = false;
+        fullReply = ask_gemini_interactions(GEMINI_MODEL_PRIMARY, promptText, imgB64, imgB64Len, isContextExpired);
+
+        // CHỈ đổi sang Gemini 3.1 khi server báo HẾT CONTEXT / LỖI SESSION CŨ:
+        if (fullReply.length() == 0 && isContextExpired && pipelineBusy) {
+            Serial.printf("[%6.2fs][NET] >>> Gemini 3.5 báo hết Context/Lỗi Session -> Thử phiên mới với Gemini 3.1 [%s]... <<<\n",
+                          millis() / 1000.0f, GEMINI_MODEL_FALLBACK);
+            bool retryExpired = false;
+            fullReply = ask_gemini_interactions(GEMINI_MODEL_FALLBACK, promptText, imgB64, imgB64Len, retryExpired);
+        }
+
+        if (fullReply.length() > 0) break;
+
+        // 2. Nếu Gemini gặp sự cố/quá tải -> Nhảy thẳng sang Tầng 2: Groq Vision LLM!
+        Serial.printf("[%6.2fs][NET] >>> Gemini gặp sự cố -> Nhảy sang Tầng 2 (Groq Vision [%s])... <<<\n",
+                      millis() / 1000.0f, kGroqModels[groqModelIdx]);
+        bool isRateLimit = false;
+        fullReply = ask_groq_vision(kGroqModels[groqModelIdx], promptText, imgB64, imgB64Len, isRateLimit);
+
+        // Nếu Groq bị Rate Limit -> tự động đảo model Groq (3.8 <-> 3.6) và thử lại ngay
+        if (fullReply.length() == 0 && isRateLimit && pipelineBusy) {
+            groqModelIdx = (groqModelIdx + 1) % 2; // Đổi sang model kia
+            Serial.printf("[%6.2fs][NET] >>> Groq bị Rate Limit! Đổi sang '%s' và thử lại ngay... <<<\n",
+                          millis() / 1000.0f, kGroqModels[groqModelIdx]);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            fullReply = ask_groq_vision(kGroqModels[groqModelIdx], promptText, imgB64, imgB64Len, isRateLimit);
+        }
+
+        if (fullReply.length() > 0) break;
+
+        if (swapRound < 2 && pipelineBusy) {
+            Serial.printf("[%6.2fs][NET] >>> Hoán đổi Vòng 1 kết thúc. Bắt đầu hoán đổi Vòng 2... <<<\n", millis() / 1000.0f);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    if (fullReply.length() > 0) {
+        lastGroqUserPrompt = promptText;
+        lastGroqAiReply = fullReply;
+
+        // Sao lưu ảnh Base64 vào PSRAM cho các lượt hỏi tiếp theo (nếu là ảnh của lượt đầu)
+        if (imgB64 && imgB64Len > 0 && !isFollowUpSession) {
+            if (lastSavedImgB64) free(lastSavedImgB64);
+            lastSavedImgB64 = (uint8_t *)ps_malloc(imgB64Len);
+            if (lastSavedImgB64) {
+                memcpy(lastSavedImgB64, imgB64, imgB64Len);
+                lastSavedImgB64Len = imgB64Len;
+            }
+        }
+    }
+
+    if (imgB64) {
+        free(imgB64);
+        imgB64 = NULL;
+    }
 
     return fullReply;
 }
@@ -763,10 +1823,12 @@ static String send_audio_image_to_gemini(void) {
 // ============================================================
 static void ai_net_task(void *pv) {
     while (true) {
-        // Proactive Wi-Fi: đảm bảo Wi-Fi kết nối sẵn sàng trong lúc ghi âm
+        // Proactive Wi-Fi & SSL Pre-connect: kết nối sẵn Wi-Fi và đường truyền SSL tới Groq trong lúc người dùng đang nói
         if (pipelineBusy && !dataReady) {
-            ensure_wifi();
-            vTaskDelay(pdMS_TO_TICKS(30));
+            if (ensure_wifi()) {
+                pre_connect_groq();
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
@@ -776,14 +1838,28 @@ static void ai_net_task(void *pv) {
         }
 
         if (!ensure_wifi()) {
-            Serial.println("[NET] Bỏ lượt hỏi — Wi-Fi không kết nối được");
+            Serial.printf("[%6.2fs][NET] Bỏ lượt hỏi — Wi-Fi không kết nối được\n", millis() / 1000.0f);
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
+
             pipelineBusy = false; dataReady = false;
+            wifi_sleep();
             continue;
         }
         if (!creds_loaded) wifi_creds_refresh();
         if (cached_api_key.length() == 0) {
-            Serial.println("[NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!");
+            Serial.printf("[%6.2fs][NET] Bỏ lượt hỏi — CHƯA CÓ API KEY!\n", millis() / 1000.0f);
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
+
             pipelineBusy = false; dataReady = false;
+            wifi_sleep();
             continue;
         }
 
@@ -791,18 +1867,40 @@ static void ai_net_task(void *pv) {
         String reply = send_audio_image_to_gemini();
 
         if (reply.length() > 0 && pipelineBusy) {
-            // Đợi toàn bộ câu trong queue được TTS worker giải mã và loa phát xong 100%
-            uint32_t tmo = millis() + 25000;
-            while ((uxQueueMessagesWaiting(ttsSentenceQueue) > 0 || tts_driver_is_busy() || tone_driver_stream_available() > 0) &&
-                   millis() < tmo && pipelineBusy) {
-                vTaskDelay(pdMS_TO_TICKS(20));
+            // Theo dõi động: chờ TTS giải mã và loa phát xong 100% tất cả các câu (không giới hạn 25s cứng)
+            uint32_t lastActivityMs = millis();
+            while (pipelineBusy) {
+                bool isBusy = (uxQueueMessagesWaiting(ttsSentenceQueue) > 0 ||
+                               tts_driver_is_busy() ||
+                               tone_driver_stream_available() > 0);
+                if (isBusy) {
+                    lastActivityMs = millis();
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                } else {
+                    // Đợi thêm 150ms để chắc chắn không còn âm thanh sót lại
+                    if (millis() - lastActivityMs >= 150) break;
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(150));
+
+            // Tiếng chuông báo hiệu hoàn thành toàn bộ câu trả lời
+            Serial.printf("[%6.2fs][AI] >>> Hoàn thành câu trả lời! Phát tiếng chuông báo hiệu <<<\n", millis() / 1000.0f);
+            tone_driver_play_captain_chime();
+            vTaskDelay(pdMS_TO_TICKS(350)); // Chờ tiếng chuông ngân vang trọn vẹn 350ms
+        } else if (pipelineBusy) {
+            // Khi kết nối thất bại (SSL/DNS/Server Error) → phát giọng fail offline
+            tone_driver_waiting_music_set(false);
+            Serial.printf("[%6.2fs][AI] >>> Phát giọng nói OFFLINE: 'Kết nối không thành công' <<<\n", millis() / 1000.0f);
+            tone_driver_stream_set_active(false);
+            tts_driver_play_progmem(OFFLINE_FAIL_MP3, OFFLINE_FAIL_MP3_LEN);
+            tts_driver_wait_playback_done();
         }
 
+        tone_driver_waiting_music_set(false);
         tone_driver_stream_set_active(false);
         pipelineBusy = false;
         dataReady = false;
+        wifi_sleep();
     }
 }
 
@@ -813,6 +1911,7 @@ void ai_pipeline_start(void) {}
 void ai_pipeline_stop(void) {
     if (!pipelineBusy) return;
     pipelineBusy = false; dataReady = false;
+    tone_driver_waiting_music_set(false);
     tts_driver_stop();
     tone_driver_stream_set_active(false);
     wifi_sleep();
@@ -825,7 +1924,7 @@ bool ai_pipeline_is_busy(void) {
 
 void ai_pipeline_net_task_start(void) {
     if (!ttsSentenceQueue) {
-        ttsSentenceQueue = xQueueCreate(8, sizeof(char *));
+        ttsSentenceQueue = xQueueCreate(32, sizeof(char *)); // 32 câu thoải mái cho câu chuyện dài
     }
     if (!ttsWorkerTaskHandle) {
         xTaskCreatePinnedToCore(tts_worker_task, "tts_worker", 10240, NULL, 3, &ttsWorkerTaskHandle, 0);

@@ -181,10 +181,10 @@
 // Detect by stddev of SV over a sliding window (500ms @ 20ms).
 // Hysteresis timers prevent gate flicker.
 // ============================================================
-#define MOTION_WINDOW_SAMPLES  25   // 25 samples x 20ms = 500ms window
-#define MOTION_STDDEV_G       0.10  // Motion stddev threshold (g)
-#define MOTION_ON_MS          200   // Enable gate after 200ms of sustained movement
-#define MOTION_OFF_MS         1000  // Disable gate after 1000ms of sustained stillness
+#define MOTION_WINDOW_SAMPLES  30   // 30 samples x 20ms = 600ms window
+#define MOTION_STDDEV_G       0.12  // Motion stddev threshold (g)
+#define MOTION_ON_MS          600   // Enable gate after 600ms of sustained walking footsteps
+#define MOTION_OFF_MS         800   // Disable gate after 800ms of sustained stillness
 
 // ============================================================
 // FALL DETECTION THRESHOLDS (3-Phase Algorithm)
@@ -220,23 +220,40 @@
 #define WIFI_SSID3              ""
 #define WIFI_PASS3              ""
 #define GEMINI_API_KEY          "" 
-#define GEMINI_MODEL            "models/gemini-3.5-flash-lite"
-#define GEMINI_MODEL_SHORT      "gemini-3.5-flash-lite"
+#define GEMINI_MODEL_PRIMARY    "gemini-3.5-flash-lite"
+#define GEMINI_MODEL_FALLBACK   "gemini-3.1-flash-lite"
+#define GEMINI_MODEL_SHORT      GEMINI_MODEL_PRIMARY
 #define GEMINI_API_HOST         "generativelanguage.googleapis.com"
 #define GEMINI_API_PORT         443
 #define GEMINI_UPLOAD_HOST      "storage.googleapis.com"
+#define GEMINI_SESSION_TIMEOUT_MS 45000  // [ĐÂY LÀ CHỖ CHỈNH SỐ GIÂY RESET HỘI THOẠI] (45000ms = 45s)
 
-// Hold-to-Talk: bấm giữ để ghi âm, thả để gửi. Tối đa 8 giây.
+// Groq Whisper LPU Speech-to-Text & Qwen Vision LLM (~250ms)
+#define GROQ_API_KEY            ""
+#define GROQ_API_HOST           "api.groq.com"
+#define GROQ_API_PORT           443
+#define GROQ_MODEL              "whisper-large-v3"
+#define GROQ_VISION_MODEL_A     "qwen/qwen3.8-27b"
+#define GROQ_VISION_MODEL_B     "qwen/qwen3.6-27b"
+
+// Deepgram Nova STT (Tầng 2 STT - Hỗ trợ cả REST và Live WebSocket Streaming)
+#define DEEPGRAM_API_KEY        ""
+#define DEEPGRAM_API_HOST       "api.deepgram.com"
+#define DEEPGRAM_API_PORT       443
+#define DEEPGRAM_MODEL          "nova-3"
+#define ENABLE_DEEPGRAM_STREAMING 0   // 0 = REST Buffer (Ghi âm xong gửi WAV an toàn 100%), 1 = WebSocket
+
+// Hold-to-Talk: bấm giữ để ghi âm, thả để gửi (Thoải mái nói chuyện, tối đa 60 giây).
 #define AI_AUDIO_SAMPLE_RATE    16000
-#define AI_AUDIO_MAX_RECORD_MS  8000
-#define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 128000
+#define AI_AUDIO_MAX_RECORD_MS  60000
+#define AI_AUDIO_MAX_SAMPLES    (AI_AUDIO_MAX_RECORD_MS * AI_AUDIO_SAMPLE_RATE / 1000)  // 960000 samples (1.92MB trong PSRAM)
 #define AI_AUDIO_GAIN           2.0f   // Khuếch đại PCM khi ghi âm (như mic_ai_cam_test)
 
 // JPEG encode từ frame RGB565 (GC2145 không có JPEG HW -> fmt2jpg)
-#define AI_JPEG_QUALITY          40   // Tối ưu 40: ảnh cực nhẹ (~8KB), nén & upload siêu tốc, AI nhận diện chuẩn xác
+#define AI_JPEG_QUALITY          30   // Tối ưu 30: ảnh siêu nhẹ (~4KB), nén & upload 30ms, Google Vision xử lý tức thì
 #define AI_JPEG_BUF_SIZE         (128 * 1024)
 
-// Ring buffer for TTS/response audio playback (PSRAM)
+// Ring buffer for TTS/response audio playback (PSRAM)  
 // Larger buffer (256KB) to accommodate local TTS PCM generation
 #define AI_PCM_RINGBUF_SIZE     (256 * 1024)
 
