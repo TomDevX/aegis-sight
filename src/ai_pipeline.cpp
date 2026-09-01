@@ -661,26 +661,55 @@ static void ai_audio_task(void *pv) {
 
                 if (!alloc_buffers()) continue;
 
-                // Kiểm tra xem có phải lần nhấn thứ 2 trong vòng 350ms không (Double-Click)
-                if (lastBtnReleaseMs > 0 && (now - lastBtnReleaseMs <= 350)) {
-                    isFollowUpSession = true;
-                    Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI <<< \n", millis() / 1000.0f);
-                    tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
-                } else {
-                    isFollowUpSession = false;
-                    clear_session_memory(); // Reset trí nhớ cả Gemini & Groq
-                    Serial.printf("[%6.2fs][BTN] >>> BẤM NÚT: CHỦ ĐỀ MỚI <<< \n", millis() / 1000.0f);
-                    tone_driver_play_quick_beep();  // 🎵 Tiếng "Tít" đơn
+                uint32_t pressStart = millis();
+                bool isHold = false;
+                
+                // Đợi tối đa 250ms xem người dùng đè giữ hay nhấp nhả
+                while (digitalRead(BTN_TRIGGER) == LOW) {
+                    if (millis() - pressStart >= 250) {
+                        isHold = true;
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(5));
                 }
 
-                // Thu âm ngay lập tức trong suốt thời gian người dùng giữ nút
-                recordSamples = record_until_release();
-                lastBtnReleaseMs = millis();
+                if (isHold) {
+                    // 1. BẤM GIỮ ĐƠN (HOLD TO TALK) -> HỎI CÂU HỎI MỚI (CHỦ ĐỀ MỚI)
+                    isFollowUpSession = false;
+                    clear_session_memory();
+                    Serial.printf("[%6.2fs][BTN] >>> BẤM GIỮ ĐƠN: HỎI CÂU HỎI MỚI <<< \n", millis() / 1000.0f);
+                    tone_driver_play_quick_beep(); // 🎵 Tiếng "Tít" đơn
+                    recordSamples = record_until_release();
+                } else {
+                    // Người dùng vừa nhấp nhả nhanh (< 250ms)
+                    // Đợi tối đa 300ms xem có cái nhấn thứ 2 không (Double-Click)
+                    uint32_t waitSecond = millis();
+                    bool hasSecondPress = false;
+                    while (millis() - waitSecond < 300) {
+                        if (digitalRead(BTN_TRIGGER) == LOW) {
+                            vTaskDelay(pdMS_TO_TICKS(15)); // Chống rung phím lần 2
+                            if (digitalRead(BTN_TRIGGER) == LOW) {
+                                hasSecondPress = true;
+                                break;
+                            }
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                    }
 
-                // Nếu người dùng chỉ nhấp nhả cực nhanh (< 250ms ~ 4000 samples) -> Chụp ảnh mô tả không cần nói
-                if (recordSamples < 4000) {
-                    recordSamples = 0; // Không gửi audio ngắn ngủn, chuyển sang chế độ mô tả ảnh thuần túy
-                    Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH (<250ms): CHUYỂN SANG MÔ TẢ ẢNH <<< \n", millis() / 1000.0f);
+                    if (hasSecondPress) {
+                        // 2. BẤM ĐÚP (DOUBLE-CLICK) -> NỐI TIẾP HỘI THOẠI CŨ (GIỮ NGUYÊN TRÍ NHỚ)
+                        isFollowUpSession = true;
+                        Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI (GIỮ TRÍ NHỚ) <<< \n", millis() / 1000.0f);
+                        tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
+                        recordSamples = record_until_release();
+                    } else {
+                        // 3. NHẤP NHANH 1 CÁI (SINGLE CLICK) -> CHỤP ẢNH MÔ TẢ NGAY (KHÔNG GHI ÂM)
+                        isFollowUpSession = false;
+                        clear_session_memory();
+                        Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH 1 CÁI: CHỤP ẢNH MÔ TẢ NGAY <<< \n", millis() / 1000.0f);
+                        tone_driver_play_quick_beep();
+                        recordSamples = 0;
+                    }
                 }
 
                 // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
@@ -1015,8 +1044,23 @@ static String deepgram_transcribe(const uint8_t *wavBuf, size_t wavSize, bool &i
     return transcribedText;
 }
 
+static String escape_json_str(const String &src) {
+    String out = "";
+    out.reserve(src.length() + 16);
+    for (size_t i = 0; i < src.length(); i++) {
+        char c = src.charAt(i);
+        if (c == '\"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') {}
+        else if (c == '\t') out += "\\t";
+        else out += c;
+    }
+    return out;
+}
+
 // ============================================================
-// Core 0: Gửi Text + Base64 JPEG lên Groq Vision (OpenAI Format)
+// Core 0: Gửi câu hỏi Text + Ảnh lên Groq Vision API (Qwen 3.8/3.6)
 // ============================================================
 static String ask_groq_vision(const char *modelName, const String &promptText,
                               const uint8_t *imgB64, size_t imgB64Len, bool &isRateLimit) {
@@ -1042,20 +1086,24 @@ static String ask_groq_vision(const char *modelName, const String &promptText,
 
     bool useMultiTurn = (isFollowUpSession && lastGroqUserPrompt.length() > 0 && lastSavedImgB64 && lastSavedImgB64Len > 0);
 
+    String safePrompt = escape_json_str(promptText);
     String jsonPart1 = "";
     String jsonPart2 = "";
     size_t totalLen = 0;
 
     if (useMultiTurn) {
         // Gửi Multi-turn: Lượt 1 (Ảnh cũ + Prompt cũ) -> AI Reply cũ -> Lượt 2 (Prompt mới)
+        String safeOldPrompt = escape_json_str(lastGroqUserPrompt);
+        String safeOldReply  = escape_json_str(lastGroqAiReply);
+
         jsonPart1 = "{\"model\":\"" + String(modelName) + "\",\"messages\":["
                     "{\"role\":\"user\",\"content\":["
-                    "{\"type\":\"text\",\"text\":\"" + lastGroqUserPrompt + "\"},"
+                    "{\"type\":\"text\",\"text\":\"" + safeOldPrompt + "\"},"
                     "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
 
         jsonPart2 = "\"}}]},"
-                    "{\"role\":\"assistant\",\"content\":\"" + lastGroqAiReply + "\"},"
-                    "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"" + promptText + "\"}]}"
+                    "{\"role\":\"assistant\",\"content\":\"" + safeOldReply + "\"},"
+                    "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"" + safePrompt + "\"}]}"
                     "],\"temperature\":0.3,\"top_p\":0.95,\"reasoning_effort\":\"none\",\"max_completion_tokens\":300,\"stream\":true}";
 
         totalLen = jsonPart1.length() + lastSavedImgB64Len + jsonPart2.length();
@@ -1063,7 +1111,7 @@ static String ask_groq_vision(const char *modelName, const String &promptText,
     } else {
         // Single Turn thông thường
         jsonPart1 = "{\"model\":\"" + String(modelName) + "\",\"messages\":[{\"role\":\"user\",\"content\":["
-                    "{\"type\":\"text\",\"text\":\"" + promptText + "\"},"
+                    "{\"type\":\"text\",\"text\":\"" + safePrompt + "\"},"
                     "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
         jsonPart2 = "\"}}]}],\"temperature\":0.3,\"top_p\":0.95,\"reasoning_effort\":\"none\",\"max_completion_tokens\":300,\"stream\":true}";
         totalLen = jsonPart1.length() + imgB64Len + jsonPart2.length();
@@ -1696,10 +1744,9 @@ static String send_audio_image_to_gemini(void) {
     }
 
     // ============================================================
-    // HOÁN ĐỔI THÔNG MINH 2 VÒNG (GEMINI <-> GROQ)
-    // Vòng 1: Gemini 3.5 (1 lần) -> Thất bại -> Groq Vision (3.8 <-> 3.6)
-    // Vòng 2: Nếu Groq thất bại -> Thử lại Gemini 3.5 -> Thử lại Groq
-    // Sau 2 vòng mà cả 2 đều không phản hồi -> Mới báo lỗi kết nối!
+    // HOÁN ĐỔI THÔNG MINH 2 VÒNG:
+    // Tầng 1: Google Gemini Interactions API (gemini-3.5 <-> 3.1 với SSE Real-time Stream & Server-side Session ID)
+    // Tầng 2: Groq Vision LLM (Qwen 3.8 <-> 3.6 với Multi-turn lưu trong PSRAM)
     // ============================================================
     static const char *kGroqModels[] = { GROQ_VISION_MODEL_A, GROQ_VISION_MODEL_B };
     static size_t groqModelIdx = 0;
@@ -1709,7 +1756,7 @@ static String send_audio_image_to_gemini(void) {
     for (int swapRound = 1; swapRound <= 2; swapRound++) {
         if (!pipelineBusy) break;
 
-        // 1. Thử Google Gemini Interactions API (Stateful Session Memory)
+        // 1. Thử Tầng 1: Google Gemini Interactions API (Stateful Session Memory)
         Serial.printf("[%6.2fs][NET] >>> [Vòng %d/2] Thử Tầng 1: Google Gemini Interactions API [%s]... <<<\n",
                       millis() / 1000.0f, swapRound, GEMINI_MODEL_PRIMARY);
         bool isContextExpired = false;
@@ -1725,22 +1772,22 @@ static String send_audio_image_to_gemini(void) {
 
         if (fullReply.length() > 0) break;
 
-        // 2. Tất cả các trường hợp còn lại (Gemini bảo trì, hàng đợi lâu, timeout 10s) -> Nhảy thẳng sang Groq Vision!
-        Serial.printf("[%6.2fs][NET] >>> Gemini gặp sự cố/quá tải -> Nhảy thẳng sang Tầng 2 (Groq Vision [%s])... <<<\n",
+        // 2. Nếu Gemini gặp sự cố/quá tải -> Nhảy thẳng sang Tầng 2: Groq Vision LLM!
+        Serial.printf("[%6.2fs][NET] >>> Gemini gặp sự cố -> Nhảy sang Tầng 2 (Groq Vision [%s])... <<<\n",
                       millis() / 1000.0f, kGroqModels[groqModelIdx]);
         bool isRateLimit = false;
         fullReply = ask_groq_vision(kGroqModels[groqModelIdx], promptText, imgB64, imgB64Len, isRateLimit);
-        if (fullReply.length() > 0) break;
 
         // Nếu Groq bị Rate Limit -> tự động đảo model Groq (3.8 <-> 3.6) và thử lại ngay
-        if (isRateLimit && pipelineBusy) {
+        if (fullReply.length() == 0 && isRateLimit && pipelineBusy) {
             groqModelIdx = (groqModelIdx + 1) % 2; // Đổi sang model kia
             Serial.printf("[%6.2fs][NET] >>> Groq bị Rate Limit! Đổi sang '%s' và thử lại ngay... <<<\n",
                           millis() / 1000.0f, kGroqModels[groqModelIdx]);
             vTaskDelay(pdMS_TO_TICKS(50));
             fullReply = ask_groq_vision(kGroqModels[groqModelIdx], promptText, imgB64, imgB64Len, isRateLimit);
-            if (fullReply.length() > 0) break;
         }
+
+        if (fullReply.length() > 0) break;
 
         if (swapRound < 2 && pipelineBusy) {
             Serial.printf("[%6.2fs][NET] >>> Hoán đổi Vòng 1 kết thúc. Bắt đầu hoán đổi Vòng 2... <<<\n", millis() / 1000.0f);

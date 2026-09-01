@@ -40,7 +40,7 @@ static size_t waitingMusicTotalSamples = 0;
 static size_t waitingMusicPlayIdx = 0;
 static volatile bool waitingMusicActive = false;
 
-static bool stop_check_stream(void) { return !streamActive; }
+static bool stop_check_stream(void) { return !streamActive || toneStopFlag; }
 static bool stop_check_waiting(void) { return !waitingMusicActive || streamActive || toneStopFlag; }
 
 static bool spk_install_i2s(void) {

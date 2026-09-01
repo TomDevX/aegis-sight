@@ -223,12 +223,8 @@ static void ultrasonic_task(void *pvParameters) {
             current_zone = ZONE_NONE;
         }
 
-        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz). Khi đang hỏi AI, giãn cách 80ms để nhường bus cho HTTPS SSL
-        if (ai_pipeline_is_busy()) {
-            vTaskDelay(pdMS_TO_TICKS(80));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(25));
-        }
+        // 4. Bước 4: Nghỉ 25ms (tần số lấy mẫu 40Hz bảo đảm độ nhạy phát hiện té ngã)
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
 }
 
