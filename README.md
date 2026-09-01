@@ -1,172 +1,100 @@
 # Aegis Sight
 
-AI assistive headband for visually impaired. Built on **ESP32-S3** with camera, mic, speaker, ultrasonic, and IMU — talks to **Gemini** via HTTP REST for voice Q&A.
+**Kính Thông Minh Trợ Thị Tích Hợp Đa Trí Tuệ Nhân Tạo Dành Cho Người Khiếm Thị**
+
+Aegis Sight là thiết bị đeo hỗ trợ người khiếm thị xây dựng trên nền tảng vi điều khiển **ESP32-S3 (16MB Flash, 8MB PSRAM)** tích hợp Camera, Micro I2S, Loa Khuếch đại MAX98357A, Cảm biến Siêu âm HC-SR04 và IMU MPU6050 — tương tác giọng nói thời gian thực với độ trễ cực thấp (<1.5s) thông qua kiến trúc **Đa Tầng AI Hoán Đổi Thông Minh (Google Gemini + Groq LPU)**.
 
 ---
 
-## Features
+## 🌟 Tính Năng Nổi Bật
 
-- **🤖 AI Hold-to-Talk** — press button, ask, release → Gemini streams audio answer to speaker
-- **📡 Obstacle Beep** — HC-SR04 beeps faster as obstacles get closer (<50cm = rapid)
-- **🚨 Fall Detection** — MPU6050 3-phase (free-fall → impact → inactivity) → SOS alarm
-- **🔊 Auto Volume** — mic measures ambient noise, adjusts speaker volume 1-21
-- **⚙️ Config Portal** — first boot: AP `AegisSight-Setup` → web form for Wi-Fi + API key
+- **🤖 AI Đa Tầng Thời Gian Thực (<1.5s)**:
+  - **Tầng 1 (Chính)**: **Google Gemini Interactions API (`gemini-3.5-flash-lite`)** với SSE Streaming trực tiếp và lưu trữ Session ID ngữ cảnh Server-side.
+  - **Tầng 2 (Dự phòng)**: **Groq Vision LLM (`qwen/qwen3.8-27b` / `qwen/qwen3.6-27b`)** với bộ nhớ Multi-turn lưu trữ trong 8MB PSRAM.
+  - **STT Giọng Nói**: **Groq Whisper Large v3** (~0.3s) + Dự phòng **Deepgram Nova-3**.
+  - **TTS Phát Loa**: Google Translate TTS với DNS Caching 0ms + Streaming MP3 Chunk 4KB.
+  - **Nhạc Chờ**: Elevator Music giải mã sẵn trong PSRAM (Zero-CPU) phát trong lúc chờ AI phản hồi.
+- **🎮 Cử Chỉ Nút Bấm Đa Năng**:
+  - **Bấm Giữ ($\ge 250\text{ms}$)**: Hỏi câu hỏi mới (Tiếng "Tít" đơn, reset ngữ cảnh).
+  - **Bấm Đúp (Nhấp 1 cái $\rightarrow$ Bấm giữ cái thứ 2)**: Nối tiếp hội thoại cũ (Tiếng "Tít-Tít" đôi, soi lại ảnh cũ và nhớ câu trả lời trước).
+  - **Nhấp Nhanh 1 Cái (<250ms)**: Chụp ảnh mô tả nhanh quang cảnh/chữ viết phía trước (không cần nói).
+- **🚶 Motion Gate (Cảm Biến Siêu Âm Thông Minh)**:
+  - Cảm biến khoảng cách HC-SR04 **chỉ phát tiếng bíp khi người dùng thực sự bước đi** (nhận diện xung lực gót chân đập xuống đất: $\text{StdDev} \ge 0.12\text{G}$ và $\text{P2P} \ge 0.25\text{G}$).
+  - Đứng yên, ngồi yên hoặc **xoay đầu nhìn quanh tại chỗ $\rightarrow$ Mute $100\%$**, trả lại không gian yên tĩnh.
+- **🚨 Phát Hiện Té Ngã (Fall Detection 3 Pha)**:
+  - MPU6050 nhận diện: Rơi tự do ($<0.5\text{g}$) $\rightarrow$ Va đập ($>2.5\text{g}$) $\rightarrow$ Bất động ($\approx 1\text{g}$).
+  - Cửa sổ hủy 10s (bấm nút để hủy) $\rightarrow$ Phát còi báo động SOS cứu hộ ra loa.
+- **🔊 Tự Động Điều Chỉnh Âm Lượng (Auto-Volume)**:
+  - Micro đo độ ồn môi trường và tự động map mức âm lượng loa từ 1–21.
+- **⚙️ Config Portal (Cấu Hình Lần Đầu)**:
+  - Tự phát Wi-Fi AP `AegisSight-Setup` $\rightarrow$ Mở Captive Portal nhập SSID/Pass + API Key lưu NVS.
 
 ---
 
-## Hardware
+## 🔌 Sơ Đồ Chân Phần Cứng (Hardware Pinout)
 
-| Module | Peripheral | Pins |
-|---|---|---|
-| Right | Camera OV2640 | DVP bus (fixed on S3-CAM board) |
-| Right | Speaker (I2S TX) | BCLK=1, LRCK=3, DIN=40 |
-| Right | Ultrasonic HC-SR04 | Trig=8, Echo=9 |
-| Left | Mic INMP441 (I2S RX) | BCLK=41, WS=42, SD=2 |
-| Left | MPU6050 (I2C) | SDA=47, SCL=48 |
-| Left | Trigger Button | GPIO14 (INPUT_PULLUP, Active LOW) |
-
-Power: Li-ion in pocket → buck converter in left module → 5V across headband to right module.
+| Module / Ngoại vi | Chân Phần Cứng | Chân ESP32-S3 GPIO | Ghi chú |
+|---|---|---|---|
+| **Camera GC2145 (DVP)** | SIOD / SIOC / PCLK / XCLK / VSYNC / HREF / Y2..Y9 | `4, 5, 13, 15, 6, 7, 11, 9, 8, 10, 12, 18, 17, 16` | FPC cố định trên bo mạch |
+| **Loa MAX98357A (I2S TX)** | DIN / BCLK / LRC | `DIN=19, BCLK=20, LRC=21` | I2S Channel 1, cấp nguồn 5V từ Buck |
+| **Micro INMP441 (I2S RX)** | SD / SCK / WS / L/R | `SD=2, SCK=41, WS=42, L/R=GND` | I2S Channel 0, Left Channel 16kHz |
+| **Siêu Âm HC-SR04** | Trig / Echo | `Trig=46, Echo=3` | Nguồn 5V từ Buck, chân tự do an toàn |
+| **MPU6050 (I2C)** | SDA / SCL | `SDA=47, SCL=39` | Bus I2C phần cứng |
+| **Nút Nhấn Trigger** | Data / GND | `GPIO14 (INPUT_PULLUP)` | Active LOW |
 
 ---
 
-## How It Works — Dual-Core FreeRTOS
-
-| Core | Responsibility |
-|---|---|
-| **Core 0** | Wi-Fi, HTTP POST to Gemini, parse SSE stream |
-| **Core 1** | All hardware (ultrasonic, MPU6050, mic, speaker, AI record/playback) |
-
-All audio output shares one I2S TX channel via the tone driver. No `delay()` in tasks (except `delayMicroseconds(10)` for HC-SR04 trigger).
+## 🏗️ Kiến Trúc Hệ Thống (Dual-Core FreeRTOS)
 
 ```
-Button press (GPIO14)
-  │
-  ▼
-Core 1: Capture JPEG ──→ Start mic recording (up to 8s)
-  │
-  └── Button release / timeout ──→ dataReady = true
-                                        │
-                                        ▼
-                              Core 0: ensure_wifi() (proactive, started during recording)
-                                        │
-                                        ▼
-                              Build JSON (stream serializeJson) ──→ POST Gemini HTTPS
-                                        │
-                                        ▼
-                              SSE stream ──→ base64 PCM ──→ ring buffer ──→ Core 1 I2S speaker
-                                        │
-                                        ▼
-                              [DONE] → modem-sleep
+[ CORE 0: Mạng & Đám Mây AI ]
+   ├── Proactive Wi-Fi Reconnect (kết nối trước trong lúc thu âm)
+   ├── Groq Whisper LPU STT (~300ms) -> Trích xuất câu hỏi
+   ├── Google Gemini SSE Stream (Tầng 1) <-> Groq Vision Qwen (Tầng 2)
+   └── Google Translate TTS HTTP Stream -> Helix MP3 Decoder (Core 0/1)
+
+[ CORE 1: Phần Cứng & Thời Gian Thực ]
+   ├── Nút Nhấn Trigger Gesture Detector (Hold / Double-Click / Click)
+   ├── Thu âm Micro I2S (DMA 8x256, Noise Gate 300 LSB, Soft Limiter)
+   ├── Cảm biến Siêu âm HC-SR04 + Motion Gate (Lọc bước đi 40Hz)
+   ├── MPU6050 Fall Detection State Machine
+   └── Loa MAX98357A I2S Tone Driver & AI Voice Ring Buffer
 ```
 
 ---
 
-## Key Workflows
+## ⚡ Hướng Dẫn Biên Dịch & Nạp Firmware
 
-### AI Hold-to-Talk
-1. **Press** → JPEG captured immediately, mic starts recording into PSRAM buffer
-2. **Release / 8s timeout** → mic stops, `dataReady` flagged
-3. **Core 0** (already connected proactively) → builds JSON (JPEG + WAV), streams `serializeJson` to HTTPS
-4. SSE response → base64 decode → ring buffer → tone task plays with volume scaling
-5. `finishReason: "STOP"` → cleanup, Wi-Fi enters modem-sleep
+```bash
+# Biên dịch và nạp firmware qua cổng USB
+pio run -t upload
 
-### Obstacle Beep
-| Distance | Beep interval |
-|---|---|
-| > 150cm | Silence |
-| 100–150cm | 600ms |
-| 50–100cm | 300ms |
-| < 50cm | 80ms (rapid) |
-
-### Fall Detection (3-Phase)
-1. **Free-fall**: SV < 0.5g
-2. **Impact**: SV > 2.5g within 300ms
-3. **Inactivity**: SV ≈ 1g for 2s
-
-→ Beep 10s cancel window (press button to cancel) → SOS alarm via speaker
-
-Resets to IDLE when AI pipeline is busy (user pressing button = not falling).
-
-### Auto Volume
-- Reads mic RMS every 500ms (releases mic to AI pipeline when busy)
-- Maps RMS → volume 1-21 via `tone_driver_set_volume()`
-
-### Config Portal (First-Time Setup)
-1. On boot, if NVS has no SSID + API key → AP `AegisSight-Setup`
-2. Connect phone → captive portal opens (or `192.168.4.1`)
-3. Enter Wi-Fi SSID/PASS + Gemini API Key → save → reboot
-4. Factory reset: hold trigger button 5s on boot → clears NVS → portal again
+# Mở Serial Monitor với tốc độ 2.000.000 baud (2Mbps)
+pio device monitor -b 2000000
+```
 
 ---
 
-## Project Structure
+## 📁 Cấu Trúc Thư Mục
 
 ```
 include/
-├── config.h              Feature flags, pin definitions, thresholds
-├── secrets.h             NVS key names (no real credentials)
-├── config_portal.h       Portal AP declarations
-├── tone_driver.h         I2S tone + AI stream ring buffer API
-└── ai_pipeline.h         Pipeline start/stop/busy API
+├── config.h              Định nghĩa chân GPIO, ngưỡng cảm biến & cờ tính năng
+├── secrets.h             Định nghĩa các NVS Key cho Wi-Fi và API Key
+├── tone_driver.h         Driver phát loa I2S, nhạc chờ và Ring Buffer AI
+├── tts_driver.h          Driver tải & giải mã MP3 Google TTS
+├── motion_gate.h         Bộ lọc nhận diện bước chân MPU6050
+└── ai_pipeline.h         Khai báo pipeline đa tầng AI & FreeRTOS tasks
 
 src/
-├── main.cpp              Boot flow: factory reset → portal → init → spawn
-├── ai_pipeline.cpp       Core 0 HTTP (Wi-Fi + REST + SSE) + Core 1 Hold-to-Talk
-├── tone_driver.cpp       I2S TX, sine generator, queue, stream playback + volume
-├── secrets.cpp           Preferences (NVS) load/save/clear
-├── config_portal.cpp     Captive portal (AP + DNS + web form → NVS → restart)
-├── ultrasonic_proximity.cpp  HC-SR04 ISR → distance → beep
-├── fall_detection.cpp        MPU6050 3-phase state machine → SOS
-└── auto_volume.cpp           Mic RMS → volume mapping
+├── main.cpp              Khởi động hệ thống, kiểm tra NVS & spawn FreeRTOS tasks
+├── ai_pipeline.cpp       Toàn bộ pipeline AI: Thu âm, Gemini SSE, Groq Vision, Whisper STT
+├── motion_gate.cpp       Thuật toán lọc xung lực bước chân (StdDev + Peak-to-Peak)
+├── tone_driver.cpp       Phát nhạc chờ PSRAM, tiếng chuông & I2S Stream Loa
+├── tts_driver.cpp        HTTP Google TTS với DNS Cache & Helix Decoder
+├── ultrasonic_proximity.cpp Cảm biến HC-SR04 tích hợp Motion Gate (40Hz)
+├── fall_detection.cpp    State machine 3 pha phát hiện ngã
+├── mpu_manager.cpp       Quản lý bus I2C & lấy mẫu MPU6050
+├── secrets.cpp           NVS Preferences lưu trữ credentials
+└── config_portal.cpp     Web captive portal cấu hình Wi-Fi lần đầu
 ```
-
----
-
-## Feature Flags
-
-Define/undefine in `include/config.h` to include/exclude features at compile time.
-
-| Flag | Default | Description |
-|---|---|---|
-| `ENABLE_CAMERA_OV2640` | on | Camera for AI pipeline |
-| `ENABLE_MICROPHONE_INMP441` | on | Mic for recording + auto-volume |
-| `ENABLE_SPEAKER_I2S` | on | I2S speaker output |
-| `ENABLE_ULTRASONIC_HC_SR04` | on | Obstacle proximity beep |
-| `ENABLE_MPU6050_FALL_DETECTION` | on | Fall detection + SOS |
-| `ENABLE_AI_PIPELINE` | on | Hold-to-Talk + Gemini HTTP |
-| `ENABLE_AUTO_VOLUME` | on | Ambient noise → volume adjust |
-
-Test flags (one at a time, comment all above): `ENABLE_MIC_TEST`, `ENABLE_SPEAKER_TEST`, `ENABLE_ULTRASONIC_TEST`, `ENABLE_MPU6050_TEST`.
-
----
-
-## Build & Flash
-
-```powershell
-pio run -t upload                  # compile + flash via USB
-pio device monitor -b 115200       # serial console
-```
-
-Board: `esp32-s3-devkitc-1` (Arduino framework, 16MB Flash QIO, 8MB OPI PSRAM).
-
----
-
-## Key Design Decisions
-
-- **PSRAM mandatory** — all large buffers (`recAudio` 256KB, `jpegBuf` 64KB, `decBuf` 64KB) use `ps_malloc()`
-- **No `String` allocations** in hot paths — SSE lines parsed into stack char arrays, JSON body streamed with `serializeJson(doc, client)`
-- **Wi-Fi modem-sleep** between AI calls (~15–30mA idle); full power only during HTTP (~100mA)
-- **Credential caching** — NVS read once into globals, avoiding 7+ reads per cycle
-- **Proactive Wi-Fi** — `ensure_wifi()` called while user is still recording, overlapping reconnect with record time
-- **Legacy I2S API** (`i2s_driver_install`) — not `i2s_new_channel`
-- **I2S port conflict avoided** by `i2s_driver_uninstall()` / re-install between auto_volume and AI pipeline
-- **Zero `delay()`** in FreeRTOS tasks (exception: `delayMicroseconds(10)` for HC-SR04, `delay()` OK in `setup()`)
-
----
-
-## Todo
-
-- [x] **Phase 1** — HW validation tests for each peripheral
-- [x] **Phase 2** — Core 1 real-time tasks (ultrasonic, fall, auto-volume)
-- [x] **Phase 3** — HTTP REST + Gemini pipeline (Core 0 HTTPS + Core 1 Hold-to-Talk)
-- [x] **Phase 4** — Integration & latency tuning (< 1.5s)
