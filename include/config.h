@@ -219,7 +219,7 @@
 #define WIFI_PASS2              ""
 #define WIFI_SSID3              ""
 #define WIFI_PASS3              ""
-#define GEMINI_API_KEY          "" 
+#define GEMINI_API_KEY          ""
 #define GEMINI_MODEL_PRIMARY    "gemini-3.5-flash-lite"
 #define GEMINI_MODEL_FALLBACK   "gemini-3.1-flash-lite"
 #define GEMINI_MODEL_SHORT      GEMINI_MODEL_PRIMARY
