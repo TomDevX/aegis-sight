@@ -44,21 +44,140 @@ Aegis Sight là thiết bị đeo hỗ trợ người khiếm thị xây dựng 
 
 ---
 
-## 🏗️ Kiến Trúc Hệ Thống (Dual-Core FreeRTOS)
+## 🏗️ System Flowcharts (Kiến Trúc & Lưu Đồ Giải Thuật)
 
+### 1. System Architecture Flowchart
+
+```mermaid
+---
+config:
+  layout: dagre
+---
+flowchart TB
+ subgraph C1["Core 1: Hardware & Real-Time Sensors (40Hz)"]
+        A1["Button gestures: Hold / Double-Click / Click"]
+        A2["INMP441 Mic: Audio recording"]
+        A3["GC2145 Camera: Capture RGB565 320x240"]
+        A4["MPU6050 Motion Gate: Footstep gait filtering"]
+        A5["HC-SR04 Ultrasonic: Obstacle distance measurement"]
+        A6["MPU6050 Fall Detection: Fall detection"]
+        A7["MAX98357A Speaker: Play chimes, waiting music & AI voice"]
+  end
+ subgraph C0["Core 0: Network Protocols & AI Pipeline"]
+        B1["Proactive Wi-Fi connection while speaking"]
+        B2["STT Processing: Send audio to 3rd-party STT API (~0.3s)"]
+        B3["Multi-tier AI Orchestrator: Primary and fallback tiers"]
+        B4["TTS Processing: Stream audio from 3rd-party TTS API"]
+        B5["Audio Decoder"]
+  end
+ subgraph S_EDGE["HEAD-WORN DEVICE - ESP32-S3 DUAL-CORE"]
+    direction TB
+        C1
+        C0
+  end
+ subgraph S_CLOUD["THIRD-PARTY CLOUD AI INFRASTRUCTURE"]
+        C_STT["3rd-Party STT API (Primary / Fallback)"]
+        C_LLM1["3rd-Party Multimodal LLM (Primary tier)"]
+        C_LLM2["3rd-Party Vision LLM (Tier 2 - Multi-turn Fallback)"]
+        C_TTS["3rd-Party TTS Voice API"]
+  end
+    A1 --> A2 & A3
+    A2 --> B2
+    A3 --> B3
+    B1 --> B2
+    B2 --> C_STT
+    C_STT -- Transcribed question text --> B3
+    B3 -- Tier 1: Session ID + Prompt + Image --> C_LLM1
+    C_LLM1 -. Failover on disconnection/overload .-> C_LLM2
+    C_LLM1 -- Real-time answer streaming --> B4
+    C_LLM2 -- Real-time Token Stream --> B4
+    B4 --> C_TTS
+    C_TTS --> B5
+    B5 --> A7
+    A4 -- Enable proximity beeps --> A5
+    A6 -- Trigger SOS alarm --> A7
 ```
-[ CORE 0: Mạng & Đám Mây AI ]
-   ├── Proactive Wi-Fi Reconnect (kết nối trước trong lúc thu âm)
-   ├── Groq Whisper LPU STT (~300ms) -> Trích xuất câu hỏi
-   ├── Google Gemini SSE Stream (Tầng 1) <-> Groq Vision Qwen (Tầng 2)
-   └── Google Translate TTS HTTP Stream -> Helix MP3 Decoder (Core 0/1)
 
-[ CORE 1: Phần Cứng & Thời Gian Thực ]
-   ├── Nút Nhấn Trigger Gesture Detector (Hold / Double-Click / Click)
-   ├── Thu âm Micro I2S (DMA 8x256, Noise Gate 300 LSB, Soft Limiter)
-   ├── Cảm biến Siêu âm HC-SR04 + Motion Gate (Lọc bước đi 40Hz)
-   ├── MPU6050 Fall Detection State Machine
-   └── Loa MAX98357A I2S Tone Driver & AI Voice Ring Buffer
+---
+
+### 2. Multimodal AI Pipeline Flowchart
+
+```mermaid
+flowchart TB
+    Start(["Start: User interacts with button"]) --> CheckGesture{"Analyze button gesture"}
+    CheckGesture -- "Hold >= 250ms" --> G1["Single Hold: Record new question\nSingle Beep chime\nReset previous context"]
+    CheckGesture -- "Double-click: Click 1 -> Hold 2" --> G2["Double-Click: Record follow-up question\nDouble Beep chime\nKeep previous image & context"]
+    CheckGesture -- "Single click (<250ms)" --> G3["Single Click: Describe photo immediately\nNo audio recording"]
+    G1 --> NetInit["Core 0: Connect Wi-Fi & Capture JPEG"]
+    G2 --> NetInit
+    G3 --> NetInit
+    NetInit --> WaitTone["Play offline waiting music in PSRAM"]
+    WaitTone --> STT{"Is voice audio present?"}
+    STT -- Yes --> STT_P["Send WAV to 3rd-party primary STT API"]
+    STT -- No --> PromptGen["Generate Prompt: Request describing scene ahead"]
+    STT_P --> STTOk{"STT successful?"}
+    STTOk -- Success --> PromptGen
+    STTOk -- Network Error --> STT_F["Switch to 3rd-party fallback STT API"]
+    STT_F --> PromptGen
+    PromptGen --> LLM_Tier1["TIER 1: 3rd-Party AI LLM"]
+    LLM_Tier1 --> CheckLLM1{"Tier 1 responded?"}
+    CheckLLM1 -- "Success: SSE Stream" --> StreamTTS["Receive words -> Split sentences -> Download & Play via 3rd-party TTS API"]
+    CheckLLM1 -- "Network Error / Context Expired / Overloaded" --> LLM_Tier2["TIER 2: 3rd-Party AI LLM (Multi-turn PSRAM Memory)"]
+    LLM_Tier2 --> CheckLLM2{"Tier 2 responded?"}
+    CheckLLM2 -- Success --> StreamTTS
+    CheckLLM2 -- Rate Limited --> SwapModel["Automatically switch to fallback model and retry"]
+    SwapModel --> StreamTTS
+    CheckLLM2 -- Both Rounds Failed --> ErrorBeep["Play connection error warning beep"]
+    StreamTTS --> Done(["End: Play completion chime"])
+```
+
+---
+
+### 3. Sensor & Safety Flowchart (Motion Gate & Fall Detection)
+
+```mermaid
+flowchart TB
+    Start(["Start MPU6050 sampling cycle (40Hz / 25ms)"]) --> ReadSensors[/"Read MPU6050 accelerometer (ax, ay, az)"/]
+    ReadSensors --> CalcSV["Calculate composite acceleration: SV = sqrt(ax² + ay² + az²)"]
+    CalcSV --> Fall1{"Phase 1: Free-fall?<br>(SV &lt; 0.5G for 150-300ms)"}
+    Fall1 -- YES --> Fall2{"Phase 2: Ground impact?<br>(SV &gt; 2.5G within next 300ms)"}
+    Fall2 -- YES --> Fall3{"Phase 3: Rest inactivity?<br>(SV ≈ 1.0G sustained for 2s)"}
+    Fall3 -- "YES: Confirmed Fall" --> FallWindow["Open 10s cancellation countdown window<br>Play reminder beeps"]
+    FallWindow --> FallCancelBtn{"Did user press Trigger button?"}
+    FallCancelBtn -- "YES: False alarm" --> FallReset["Cancel fall alert & Return to normal state"]
+    FallCancelBtn -- "NO (10s expired): Unconscious" --> FallAlarm[/"PLAY SOS RESCUE ALARM VIA SPEAKER"/]
+    Fall1 -- NO --> CalcMotion["Calculate StdDev & P2P in 600ms window"]
+    Fall2 -- NO --> CalcMotion
+    Fall3 -- "NO (Regained movement)" --> CalcMotion
+    FallReset --> EndCycle(["Wait for next 25ms cycle"])
+    FallAlarm --> EndCycle
+    CalcMotion --> MotionCheck{"StdDev &gt;= 0.12G<br>AND P2P &gt;= 0.25G<br>sustained &gt;= 600ms?"}
+    MotionCheck -- "NO: Still / Rotating head" --> GateOff["Disable ultrasonic beeps (Keep silent)"]
+    GateOff --> EndCycle
+    MotionCheck -- "YES: Walking" --> GateOn[/"Activate HC-SR04 distance measurement"/]
+    GateOn --> DistCheck{"Obstacle distance (D)"}
+    DistCheck -- "D &lt;= 18cm" --> Beep1[/"Rapid beep 180ms: Danger Zone"/]
+    DistCheck -- "18cm &lt; D &lt;= 32cm" --> Beep2[/"Medium beep 320ms: Warning Zone"/]
+    DistCheck -- "32cm &lt; D &lt;= 45cm" --> Beep3[/"Slow beep 550ms: Safe Zone"/]
+    DistCheck -- D &gt; 45cm --> Beep4["No beeping"]
+    Beep1 --> EndCycle
+    Beep2 --> EndCycle
+    Beep3 --> EndCycle
+    Beep4 --> EndCycle
+
+    %% LEGEND BOX
+    subgraph LEGEND ["📝 LEGEND"]
+        direction TB
+        N_SV["• SV (Signal Vector Magnitude): Composite 3-axis acceleration vector magnitude (Orientation-invariant)<br>• G: Acceleration unit"]
+        N_MOTION["• StdDev (Standard Deviation): Standard deviation measuring footstep oscillation dispersion<br>• P2P (Peak-to-Peak): Maximum amplitude difference between peak and trough acceleration"]
+    end
+
+    %% Dotted annotations
+    CalcSV -.- N_SV
+    CalcMotion -.- N_MOTION
+
+    classDef legendStyle fill:#0f172a,stroke:#38bdf8,stroke-width:1px,stroke-dasharray: 4 4,color:#e2e8f0,text-align:left;
+    class LEGEND,N_SV,N_MOTION legendStyle;
 ```
 
 ---
