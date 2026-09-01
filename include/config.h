@@ -181,10 +181,10 @@
 // Detect by stddev of SV over a sliding window (500ms @ 20ms).
 // Hysteresis timers prevent gate flicker.
 // ============================================================
-#define MOTION_WINDOW_SAMPLES  25   // 25 samples x 20ms = 500ms window
-#define MOTION_STDDEV_G       0.10  // Motion stddev threshold (g)
-#define MOTION_ON_MS          200   // Enable gate after 200ms of sustained movement
-#define MOTION_OFF_MS         1000  // Disable gate after 1000ms of sustained stillness
+#define MOTION_WINDOW_SAMPLES  30   // 30 samples x 20ms = 600ms window
+#define MOTION_STDDEV_G       0.12  // Motion stddev threshold (g)
+#define MOTION_ON_MS          600   // Enable gate after 600ms of sustained walking footsteps
+#define MOTION_OFF_MS         800   // Disable gate after 800ms of sustained stillness
 
 // ============================================================
 // FALL DETECTION THRESHOLDS (3-Phase Algorithm)
@@ -232,7 +232,7 @@
 #define GROQ_API_KEY            ""
 #define GROQ_API_HOST           "api.groq.com"
 #define GROQ_API_PORT           443
-#define GROQ_MODEL              "whisper-large-v3-turbo"
+#define GROQ_MODEL              "whisper-large-v3"
 #define GROQ_VISION_MODEL_A     "qwen/qwen3.8-27b"
 #define GROQ_VISION_MODEL_B     "qwen/qwen3.6-27b"
 

@@ -133,14 +133,36 @@ void tts_driver_speak(const char *text, size_t len) {
     size_t mp3Len = 0;
 
     // 2. Tải toàn bộ MP3 vào RAM qua WiFiClient với dual-endpoint fallback (gtx -> tw-ob)
+    static IPAddress gttsCachedIp(0, 0, 0, 0);
+    static unsigned long lastDnsResolve = 0;
+    if (gttsCachedIp == IPAddress(0, 0, 0, 0) || (millis() - lastDnsResolve > 300000)) {
+        if (WiFi.hostByName("translate.google.com", gttsCachedIp)) {
+            lastDnsResolve = millis();
+        }
+    }
+
     for (int retry = 0; retry < 3 && mp3Len == 0 && !ttsCancel; retry++) {
         WiFiClient client;
-        client.setTimeout(1800);
+        client.setTimeout(1500);
 
-        if (!client.connect("translate.google.com", 80)) {
-            vTaskDelay(pdMS_TO_TICKS(30));
+        bool connected = false;
+        if (gttsCachedIp != IPAddress(0, 0, 0, 0)) {
+            connected = client.connect(gttsCachedIp, 80);
+        }
+        if (!connected) {
+            connected = client.connect("translate.google.com", 80);
+            if (connected) {
+                gttsCachedIp = client.remoteIP();
+                lastDnsResolve = millis();
+            }
+        }
+
+        if (!connected) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
+
+        client.setNoDelay(true);
 
         const char *clientType = (retry == 0) ? "gtx" : "tw-ob";
         String path = "/translate_tts?ie=UTF-8&tl=vi&client=" + String(clientType) + "&q=" + enc;
@@ -154,13 +176,13 @@ void tts_driver_speak(const char *text, size_t len) {
         // Bỏ qua HTTP Headers
         bool headerDone = false;
         bool is200 = false;
-        uint32_t tmo = millis() + 3000;
+        uint32_t tmo = millis() + 2500;
         char hdr[256];
         bool firstLine = true;
 
         while (client.connected() && millis() < tmo && !ttsCancel) {
             size_t n = client.readBytesUntil('\n', (uint8_t *)hdr, sizeof(hdr) - 1);
-            if (n == 0) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+            if (n == 0) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
             hdr[n] = '\0';
             while (n > 0 && (hdr[n-1] == '\r' || hdr[n-1] == ' ')) hdr[--n] = '\0';
 
@@ -173,21 +195,24 @@ void tts_driver_speak(const char *text, size_t len) {
 
         if (!headerDone || !is200 || ttsCancel) {
             client.stop();
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(30));
             continue;
         }
 
-        // Tải body MP3 siêu tốc
+        // Tải body MP3 siêu tốc (chunk 4KB)
         while (mp3Len < TTS_MP3_BUF_SIZE && !ttsCancel) {
-            if (client.available()) {
+            int avail = client.available();
+            if (avail > 0) {
                 int room = TTS_MP3_BUF_SIZE - mp3Len;
-                int got = client.read(mp3Buf + mp3Len, room > 2048 ? 2048 : room);
+                int toRead = (room > 4096) ? 4096 : room;
+                if (toRead > avail) toRead = avail;
+                int got = client.read(mp3Buf + mp3Len, toRead);
                 if (got <= 0) break;
                 mp3Len += got;
             } else if (!client.connected()) {
                 break;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(1));
+                taskYIELD();
             }
         }
         client.stop();

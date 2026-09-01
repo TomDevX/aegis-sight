@@ -284,8 +284,8 @@ static bool rec_mic_install(void) {
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
-        .dma_buf_len = 512,
+        .dma_buf_count = 8,
+        .dma_buf_len = 256,
         .use_apll = false,
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0
@@ -504,12 +504,21 @@ static size_t record_until_release(void) {
         for (int i = 0; i < samplesCount; i++) {
             if (samples >= AI_AUDIO_MAX_SAMPLES) break;
 
-            int32_t raw_sample = i2sBuffer[i] >> 14;
-            dc_offset = 0.995f * dc_offset + 0.005f * (float)raw_sample;
-            float clean_sample = (float)raw_sample - dc_offset;
+            // Trích xuất chuẩn xác từ 32-bit I2S slot của INMP441 (giống mic_test.cpp)
+            int32_t s16 = i2sBuffer[i] >> 14;
+            float sample = (float)s16;
 
-            if (clean_sample > 32000.0f) clean_sample = 32000.0f;
-            else if (clean_sample < -32000.0f) clean_sample = -32000.0f;
+            // 1. Lọc DC Offset
+            dc_offset = 0.995f * dc_offset + 0.005f * sample;
+            float clean_sample = (sample - dc_offset) * 2.5f;
+
+            // 2. Triệt tiêu hoàn toàn tạp âm xì xào nền (Noise Gate 300 LSB)
+            if (fabsf(clean_sample) < 300.0f) {
+                clean_sample = 0.0f;
+            }
+
+            if (clean_sample > 30000.0f) clean_sample = 30000.0f;
+            else if (clean_sample < -30000.0f) clean_sample = -30000.0f;
 
             int16_t sample_16bit = (int16_t)clean_sample;
             recordBuf[samples++] = sample_16bit;
@@ -620,6 +629,7 @@ static bool isFollowUpSession = false;
 // ============================================================
 static void ai_audio_task(void *pv) {
     pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    alloc_buffers(); // Cấp phát PSRAM ngay khi khởi động để lần bấm đầu tiên luôn sẵn sàng 100%!
     int lastBtn = HIGH;
     uint32_t debounceMs = 0;
     uint32_t lastBtnReleaseMs = 0;
@@ -642,56 +652,36 @@ static void ai_audio_task(void *pv) {
             }
             #endif
             if (!pipelineBusy) {
-                // Nhận diện 3 Cử Chỉ Nút Bấm:
-                // 1. Nhấp nhanh 1 cái (Short Click) -> Chụp ảnh mô tả ngay (không cần nói)
-                // 2. Bấm giữ đơn (Hold to Talk)      -> Nói câu hỏi mới (Chủ đề mới)
-                // 3. Bấm đúp giữ (Double-Click Hold) -> Nói câu hỏi nối tiếp (Hội thoại cũ)
-                uint32_t pressStart = millis();
-                while (digitalRead(BTN_TRIGGER) == LOW) {
-                    if (millis() - pressStart > 180) {
-                        // Đang bấm giữ > 180ms -> BẤM GIỮ ĐỂ NÓI (Hold to Talk)
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-
-                if (digitalRead(BTN_TRIGGER) == HIGH) {
-                    // Người dùng vừa nhấp nhả nhanh (< 180ms)
-                    // Đợi tối đa 220ms xem có cái nhấn thứ 2 không
-                    uint32_t waitSecondPress = millis();
-                    bool secondPressed = false;
-                    while (millis() - waitSecondPress < 220) {
-                        if (digitalRead(BTN_TRIGGER) == LOW) {
-                            secondPressed = true;
-                            break;
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(5));
-                    }
-
-                    if (secondPressed) {
-                        // 3. BẤM ĐÚP GIỮ -> NỐI TIẾP HỘI THOẠI CŨ
-                        isFollowUpSession = true;
-                        Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI <<< \n", millis() / 1000.0f);
-                        tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
-                        recordSamples = record_until_release();
-                    } else {
-                        // 1. NHẤP NHANH 1 CÁI (SHORT CLICK) -> CHỤP ẢNH MÔ TẢ NGAY (KHÔNG CẦN NÓI)
-                        isFollowUpSession = false;
-                        clear_session_memory(); // Reset trí nhớ cả Gemini & Groq
-                        Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH 1 CÁI: CHỤP ẢNH MÔ TẢ NGAY (KHÔNG GHI ÂM) <<< \n", millis() / 1000.0f);
-                        tone_driver_play_quick_beep();  // 🎵 Tiếng "Tít" đơn
-                        recordSamples = 0; // Không thu âm, chuyển thẳng sang chụp ảnh
-                    }
-                } else {
-                    // 2. BẤM GIỮ ĐƠN (> 180ms) -> HỎI CÂU HỎI MỚI (Hold to Talk)
-                    isFollowUpSession = false;
-                    clear_session_memory(); // Reset trí nhớ cả Gemini & Groq
-                    Serial.printf("[%6.2fs][BTN] >>> BẤM GIỮ ĐƠN: HỎI CÂU HỎI MỚI <<< \n", millis() / 1000.0f);
-                    tone_driver_play_quick_beep();  // 🎵 Tiếng "Tít" đơn
-                    recordSamples = record_until_release();
+                // Khử rung dội phím ban đầu
+                vTaskDelay(pdMS_TO_TICKS(15));
+                if (digitalRead(BTN_TRIGGER) != LOW) {
+                    lastBtn = HIGH;
+                    continue;
                 }
 
                 if (!alloc_buffers()) continue;
+
+                // Kiểm tra xem có phải lần nhấn thứ 2 trong vòng 350ms không (Double-Click)
+                if (lastBtnReleaseMs > 0 && (now - lastBtnReleaseMs <= 350)) {
+                    isFollowUpSession = true;
+                    Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI <<< \n", millis() / 1000.0f);
+                    tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
+                } else {
+                    isFollowUpSession = false;
+                    clear_session_memory(); // Reset trí nhớ cả Gemini & Groq
+                    Serial.printf("[%6.2fs][BTN] >>> BẤM NÚT: CHỦ ĐỀ MỚI <<< \n", millis() / 1000.0f);
+                    tone_driver_play_quick_beep();  // 🎵 Tiếng "Tít" đơn
+                }
+
+                // Thu âm ngay lập tức trong suốt thời gian người dùng giữ nút
+                recordSamples = record_until_release();
+                lastBtnReleaseMs = millis();
+
+                // Nếu người dùng chỉ nhấp nhả cực nhanh (< 250ms ~ 4000 samples) -> Chụp ảnh mô tả không cần nói
+                if (recordSamples < 4000) {
+                    recordSamples = 0; // Không gửi audio ngắn ngủn, chuyển sang chế độ mô tả ảnh thuần túy
+                    Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH (<250ms): CHUYỂN SANG MÔ TẢ ẢNH <<< \n", millis() / 1000.0f);
+                }
 
                 // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
                 setCpuFrequencyMhz(240);
@@ -829,10 +819,10 @@ static String groq_whisper_transcribe(const uint8_t *wavBuf, size_t wavSize, boo
     client.print(partTemp);
     client.print(partFileHeader);
     
-    // Stream file WAV nhị phân siêu tốc (chia theo TLS chunk 16KB, NoDelay)
+    // Stream file WAV nhị phân siêu tốc (chunk 2KB tối ưu cho TLS buffer của ESP32)
     size_t offset = 0;
     while (offset < wavSize && client.connected() && pipelineBusy) {
-        size_t toWrite = (wavSize - offset > 16384) ? 16384 : (wavSize - offset);
+        size_t toWrite = (wavSize - offset > 2048) ? 2048 : (wavSize - offset);
         size_t n = client.write(wavBuf + offset, toWrite);
         if (n > 0) {
             offset += n;
@@ -1048,6 +1038,7 @@ static String ask_groq_vision(const char *modelName, const String &promptText,
         Serial.printf("[%6.2fs][NET] Không thể kết nối SSL tới Groq Vision!\n", millis() / 1000.0f);
         return "";
     }
+    client.setNoDelay(true);
 
     bool useMultiTurn = (isFollowUpSession && lastGroqUserPrompt.length() > 0 && lastSavedImgB64 && lastSavedImgB64Len > 0);
 
@@ -1291,19 +1282,23 @@ static String ask_gemini_interactions(const char *currentModel, const String &pr
     if (hasPrevious) {
         jsonFooter += ",\"previous_interaction_id\":\"" + lastInteractionId + "\"";
     }
+    jsonFooter += ",\"stream\":true";
     jsonFooter += "}";
 
     size_t totalContentLength = jsonHeader.length() + jsonImage.length() + (sendImageNow ? imgB64Len : 0) + jsonFooter.length();
 
     String urlPath = String("/v1beta/interactions?key=") + cached_api_key;
 
+    client.setNoDelay(true);
     client.printf("POST %s HTTP/1.1\r\n", urlPath.c_str());
     client.printf("Host: %s\r\n", GEMINI_API_HOST);
     client.printf("Content-Type: application/json\r\n");
+    client.printf("Accept: text/event-stream\r\n");
+    client.printf("Accept-Encoding: identity\r\n");
     client.printf("Content-Length: %zu\r\n", totalContentLength);
     client.printf("Connection: close\r\n\r\n");
 
-    Serial.printf("[%6.2fs][INTERACTIONS] Gửi câu hỏi Text %s lên Gemini [%s]...\n",
+    Serial.printf("[%6.2fs][INTERACTIONS] Gửi câu hỏi Text %s lên Gemini [%s] (Real-time SSE Stream)...\n",
                   millis() / 1000.0f, sendImageNow ? "+ Ảnh mới" : "", currentModel);
 
     bool streamOk = (client.print(jsonHeader) > 0);
@@ -1394,8 +1389,12 @@ static String ask_gemini_interactions(const char *currentModel, const String &pr
                 }
             }
 
-            // Trích xuất Text trong model_output
-            // Cấu trúc: {"content":[{"text":"...","type":"text"}],"type":"model_output"}
+            // Khi nhận được tín hiệu kết thúc stream -> ngắt đọc ngay lập tức
+            if (strstr(lineBuf, "[DONE]") || strstr(lineBuf, "interaction.completed")) {
+                break;
+            }
+
+            // Trích xuất Text trong model_output hoặc step.delta streaming
             char *textKey = strstr(lineBuf, "\"type\":\"model_output\"");
             if (!textKey) textKey = strstr(lineBuf, "\"text\":");
             if (textKey) {
