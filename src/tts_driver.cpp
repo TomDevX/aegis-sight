@@ -72,15 +72,15 @@ public:
         // Gộp stereo thành mono chuẩn
         int32_t mixed = ((int32_t)sample[0] + (int32_t)sample[1]) >> 1;
 
-        // Giọng nói AI: khuếch đại to rõ 2.8x với soft-limiting chống vỡ tiếng
-        float x = (float)mixed * 2.8f;
-        if (x > 26000.0f) {
-            x = 26000.0f + (x - 26000.0f) * 0.25f;
-        } else if (x < -26000.0f) {
-            x = -26000.0f + (x + 26000.0f) * 0.25f;
+        // Giọng nói AI: độ lớn vừa phải, trong trẻo, không vỡ tiếng
+        float x = (float)mixed * 1.25f;
+        if (x > 24000.0f) {
+            x = 24000.0f + (x - 24000.0f) * 0.25f;
+        } else if (x < -24000.0f) {
+            x = -24000.0f + (x + 24000.0f) * 0.25f;
         }
-        if (x > 32000.0f) x = 32000.0f;
-        else if (x < -32000.0f) x = -32000.0f;
+        if (x > 30000.0f) x = 30000.0f;
+        else if (x < -30000.0f) x = -30000.0f;
 
         monoChunk[chunkIdx++] = (int16_t)x;
 

@@ -79,6 +79,14 @@
 #define CAM_PCLK          13
 
 // ============================================================
+// CAMERA ORIENTATION / ROTATION (Bù góc nghiêng camera gọng kính)
+// ============================================================
+// Camera thực tế bị nghiêng 110 độ sang trái -> xoay 110 độ theo chiều kim đồng hồ (quay phải)
+// để bức ảnh AI nhận được đứng thẳng tự nhiên như mắt người nhìn.
+#define CAM_ROTATE_DEGREES      110.0f  // Góc xoay bù trừ (độ, >0 là xoay theo chiều kim đồng hồ)
+#define CAM_ROTATE_SCALE        1.15f   // Hệ số zoom nhẹ để lấp đầy khung hình, giảm viền đen góc
+
+// ============================================================
 // MICROPHONE INMP441 - I2S RX (Left Module - Channel 0)
 // L/R pin tied to GND = Left channel
 // SCK -> GPIO41, WS -> GPIO42, SD -> GPIO2
@@ -125,6 +133,9 @@
 // ============================================================
 #define ULTRASONIC_TRIG   46
 #define ULTRASONIC_ECHO    3
+#define US_VOL_SAFE        3   // Âm lượng bíp siêu âm vùng an toàn (êm dịu, nhỏ gọn)
+#define US_VOL_WARN        4   // Âm lượng bíp siêu âm vùng cảnh báo
+#define US_VOL_DANGER      5   // Âm lượng bíp siêu âm vùng nguy hiểm
 
 // ============================================================
 // MPU6050 - I2C (Left Module)

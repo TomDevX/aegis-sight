@@ -208,15 +208,14 @@ static void ultrasonic_task(void *pvParameters) {
             // 2. Người dùng ĐANG DI CHUYỂN / BƯỚC ĐI (motion_gate_enabled()) -> Khi đứng yên/ngồi yên sẽ im lặng 100%!
             if (!ai_pipeline_is_busy() && isMoving && beepInterval > 0 && (now - lastBeep >= beepInterval)) {
                 lastBeep = now;
-                uint8_t vol = tone_driver_get_volume();
-                if (vol < 18) vol = 20;
                 
+                // Âm lượng bíp siêu âm nhỏ gọn, êm dịu, thoải mái cho người nghe
                 if (current_zone == ZONE_DANGER_ZONE) {
-                    tone_driver_play(TONE_DANGER, 120, 21); // 880Hz, 120ms (nốt còi ngã tròn đầy)
+                    tone_driver_play(TONE_DANGER, 80, US_VOL_DANGER); // 880Hz, 80ms
                 } else if (current_zone == ZONE_WARN_ZONE) {
-                    tone_driver_play(TONE_WARNING, 110, vol); // 740Hz, 110ms
+                    tone_driver_play(TONE_WARNING, 70, US_VOL_WARN);  // 740Hz, 70ms
                 } else if (current_zone == ZONE_SAFE_ZONE) {
-                    tone_driver_play(TONE_SLOW, 100, vol); // 587Hz, 100ms
+                    tone_driver_play(TONE_SLOW, 60, US_VOL_SAFE);     // 587Hz, 60ms
                 }
             }
         } else {

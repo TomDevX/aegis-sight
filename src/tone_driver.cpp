@@ -87,10 +87,10 @@ void tone_driver_set_sample_rate(uint32_t rate) {
 static void i2s_output(const int16_t *buf, uint32_t samples, bool (*checkStop)(void)) {
     static int16_t frame[512][2];
     
-    // Thang âm lượng 1..21: dải scale 0.70f .. 1.50f cho âm lượng cực đại, to vang khắp phòng
+    // Thang âm lượng 1..21: dải scale 0.30f .. 0.75f cho âm lượng vừa vặn, trong trẻo, không rè
     float volScale = 0.0f;
     if (currentVolume > 0) {
-        volScale = 0.70f + (float)(currentVolume - 1) * (0.80f / 20.0f);
+        volScale = 0.30f + (float)(currentVolume - 1) * (0.45f / 20.0f);
     }
 
     uint32_t pos = 0;
@@ -155,7 +155,8 @@ static void play_tone_request(const tone_request_t &req) {
     // Reset về sample rate chuẩn khi phát còi/bíp
     tone_driver_set_sample_rate(TONE_SAMPLE_RATE);
 
-    float volScale = (req.volume == 0) ? 0.0f : (0.30f + (float)req.volume * (0.70f / 21.0f));
+    // Linear scale từ 0 đến 1.0 (ở volume 21 đạt 100% công suất 32000 cho còi ngã SOS)
+    float volScale = (req.volume == 0) ? 0.0f : ((float)req.volume / 21.0f);
     const int32_t amp = (int32_t)(32000.0f * volScale);
 
     uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * req.durationMs) / 1000;
@@ -261,7 +262,8 @@ static void tone_task(void *pvParameters) {
             static int16_t waitChunk[256];
             size_t chunk = 256;
             for (size_t i = 0; i < chunk; i++) {
-                int32_t s = (int32_t)((float)waitingMusicBuf[waitingMusicPlayIdx] * 0.60f);
+                // Nhạc chờ nền Elevator Music: độ lớn vừa vặn, rõ ràng và êm tai
+                int32_t s = (int32_t)((float)waitingMusicBuf[waitingMusicPlayIdx] * 0.42f);
                 waitChunk[i] = (int16_t)s;
                 waitingMusicPlayIdx++;
                 if (waitingMusicPlayIdx >= waitingMusicTotalSamples) {
@@ -362,7 +364,7 @@ static void play_bell_tone(float freqHz, uint32_t durationMs, float decaySpeed, 
     if (vol > 21) vol = 21;
     if (vol == 0) return;
 
-    int32_t amp = 3000 + (int32_t)(vol - 1) * (26000 / 20);
+    int32_t amp = 1200 + (int32_t)(vol - 1) * (9500 / 20);
     uint32_t totalSamples = ((uint64_t)TONE_SAMPLE_RATE * durationMs) / 1000;
     if (totalSamples == 0) return;
 
@@ -411,13 +413,13 @@ static void play_bell_tone(float freqHz, uint32_t durationMs, float decaySpeed, 
 void tone_driver_play_startup(void) {
     toneStopFlag = false;
     streamActive = false;
-    play_bell_tone(523, 130, 4.5f, 20); // C5
+    play_bell_tone(523, 130, 4.5f, 14); // C5
     vTaskDelay(pdMS_TO_TICKS(110));
-    play_bell_tone(659, 130, 4.5f, 20); // E5
+    play_bell_tone(659, 130, 4.5f, 14); // E5
     vTaskDelay(pdMS_TO_TICKS(110));
-    play_bell_tone(784, 150, 4.0f, 20); // G5
+    play_bell_tone(784, 150, 4.0f, 14); // G5
     vTaskDelay(pdMS_TO_TICKS(130));
-    play_bell_tone(1046, 550, 2.5f, 21); // C6 (ngân dài thanh thoát)
+    play_bell_tone(1046, 550, 2.5f, 15); // C6 (ngân dài thanh thoát)
     vTaskDelay(pdMS_TO_TICKS(580));
 }
 
@@ -426,10 +428,10 @@ void tone_driver_play_captain_chime(void) {
     toneStopFlag = false;
     streamActive = false;
     // Nốt "Ding" (E5 - 659Hz) nhanh thanh thoát 90ms
-    play_bell_tone(659.25f, 90, 7.5f, 21);
+    play_bell_tone(659.25f, 90, 7.5f, 15);
     vTaskDelay(pdMS_TO_TICKS(15));
     // Nốt "Dong" (A4 - 440Hz) trầm ấm 130ms
-    play_bell_tone(440.00f, 130, 6.5f, 21);
+    play_bell_tone(440.00f, 130, 6.5f, 15);
     vTaskDelay(pdMS_TO_TICKS(20));
 }
 
@@ -437,25 +439,25 @@ void tone_driver_play_captain_chime(void) {
 void tone_driver_play_quick_beep(void) {
     toneStopFlag = false;
     streamActive = false;
-    play_bell_tone(880.0f, 35, 12.0f, 18); // Nốt A5 880Hz trong 35ms
+    play_bell_tone(880.0f, 35, 12.0f, 13); // Nốt A5 880Hz trong 35ms
 }
 
 // 2c. Tiếng "Tít-Tít" đôi (~90ms) báo hiệu Nối Tiếp Cuộc Trò Chuyện (Follow-up Turn)
 void tone_driver_play_double_beep(void) {
     toneStopFlag = false;
     streamActive = false;
-    play_bell_tone(880.0f, 30, 14.0f, 18);
+    play_bell_tone(880.0f, 30, 14.0f, 13);
     vTaskDelay(pdMS_TO_TICKS(25));
-    play_bell_tone(1046.5f, 35, 12.0f, 20); // Nốt C6 cao hơn vui tai
+    play_bell_tone(1046.5f, 35, 12.0f, 14); // Nốt C6 cao hơn vui tai
 }
 
 // 3. Tiếng âm báo ngắt mic khi nhả nút (Warm Soft Two-Tone Chime: êm dịu, dứt khoát ~190ms)
 void tone_driver_play_release_chime(void) {
     toneStopFlag = false;
     streamActive = false;
-    play_bell_tone(587.33f, 80, 8.0f, 19); // Nốt D5 êm nhẹ 80ms
+    play_bell_tone(587.33f, 80, 8.0f, 13); // Nốt D5 êm nhẹ 80ms
     vTaskDelay(pdMS_TO_TICKS(10));
-    play_bell_tone(440.00f, 110, 7.0f, 19); // Nốt A4 trầm ấm 110ms
+    play_bell_tone(440.00f, 110, 7.0f, 13); // Nốt A4 trầm ấm 110ms
     vTaskDelay(pdMS_TO_TICKS(15));
 }
 

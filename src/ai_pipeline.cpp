@@ -553,6 +553,60 @@ static size_t record_until_release(void) {
 }
 
 // ============================================================
+// Xoay ảnh RGB565 theo góc bất kỳ (Bù góc nghiêng camera gọng kính)
+// ============================================================
+static uint16_t *rotatedBuf = NULL;
+
+static void rotate_rgb565(const uint16_t *src, uint16_t srcW, uint16_t srcH,
+                          uint16_t *dst, uint16_t dstW, uint16_t dstH,
+                          float angleDeg, float scale) {
+    if (!src || !dst || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) return;
+    if (scale <= 0.05f) scale = 1.0f;
+
+    float rad = angleDeg * (float)M_PI / 180.0f;
+    float cosA = cosf(rad);
+    float sinA = sinf(rad);
+
+    float cx_s = (float)(srcW - 1) * 0.5f;
+    float cy_s = (float)(srcH - 1) * 0.5f;
+    float cx_d = (float)(dstW - 1) * 0.5f;
+    float cy_d = (float)(dstH - 1) * 0.5f;
+
+    // Fixed-point 16.16: Tối ưu hoá vi xử lý ESP32-S3, chạy cực nhanh < 2ms
+    float invScale = 1.0f / scale;
+    int32_t step_xx = (int32_t)((cosA * invScale) * 65536.0f);
+    int32_t step_xy = (int32_t)((-sinA * invScale) * 65536.0f);
+    int32_t step_yx = (int32_t)((sinA * invScale) * 65536.0f);
+    int32_t step_yy = (int32_t)((cosA * invScale) * 65536.0f);
+
+    float row_start_x_f = cx_s + invScale * (-cx_d * cosA - cy_d * sinA);
+    float row_start_y_f = cy_s + invScale * (cx_d * sinA - cy_d * cosA);
+
+    int32_t row_start_x = (int32_t)(row_start_x_f * 65536.0f);
+    int32_t row_start_y = (int32_t)(row_start_y_f * 65536.0f);
+
+    size_t dst_idx = 0;
+    for (uint16_t yd = 0; yd < dstH; yd++) {
+        int32_t xs_fp = row_start_x;
+        int32_t ys_fp = row_start_y;
+        for (uint16_t xd = 0; xd < dstW; xd++) {
+            int32_t xs = xs_fp >> 16;
+            int32_t ys = ys_fp >> 16;
+            if (xs >= 0 && xs < srcW && ys >= 0 && ys < srcH) {
+                dst[dst_idx] = src[ys * srcW + xs];
+            } else {
+                dst[dst_idx] = 0x0000; // Đen viền nếu nằm ngoài khung ảnh gốc
+            }
+            dst_idx++;
+            xs_fp += step_xx;
+            ys_fp += step_xy;
+        }
+        row_start_x += step_yx;
+        row_start_y += step_yy;
+    }
+}
+
+// ============================================================
 // Chụp ảnh RGB565 -> nén JPEG bằng fmt2jpg (giống captureJpeg test)
 // ============================================================
 static bool capture_jpeg(void) {
@@ -567,8 +621,36 @@ static bool capture_jpeg(void) {
     pixformat_t srcFmt = (pixformat_t)fb->format;
     bool ok = false;
 
+    uint16_t srcW = fb->width, srcH = fb->height;
+    uint8_t *encodeBuf = fb->buf;
+    size_t encodeLen = fb->len;
+    uint16_t encodeW = srcW, encodeH = srcH;
+
+#ifdef CAM_ROTATE_DEGREES
+    if (fabsf((float)CAM_ROTATE_DEGREES) > 0.001f && srcFmt == PIXFORMAT_RGB565) {
+        float normDeg = fmodf(fmodf((float)CAM_ROTATE_DEGREES, 360.0f) + 360.0f, 360.0f);
+        bool isPortrait = (normDeg >= 45.0f && normDeg <= 135.0f) || (normDeg >= 225.0f && normDeg <= 315.0f);
+        uint16_t dstW = isPortrait ? srcH : srcW;
+        uint16_t dstH = isPortrait ? srcW : srcH;
+
+        if (!rotatedBuf) {
+            rotatedBuf = (uint16_t *)ps_malloc(320 * 320 * sizeof(uint16_t));
+        }
+
+        if (rotatedBuf) {
+            rotate_rgb565((const uint16_t *)fb->buf, srcW, srcH,
+                          rotatedBuf, dstW, dstH,
+                          (float)CAM_ROTATE_DEGREES, (float)CAM_ROTATE_SCALE);
+            encodeBuf = (uint8_t *)rotatedBuf;
+            encodeLen = (size_t)dstW * dstH * sizeof(uint16_t);
+            encodeW = dstW;
+            encodeH = dstH;
+        }
+    }
+#endif
+
     if (srcFmt == PIXFORMAT_RGB565 || srcFmt == PIXFORMAT_GRAYSCALE) {
-        ok = fmt2jpg(fb->buf, fb->len, fb->width, fb->height, srcFmt,
+        ok = fmt2jpg(encodeBuf, encodeLen, encodeW, encodeH, srcFmt,
                      AI_JPEG_QUALITY, &outJpg, &outLen);
     } else {
         // Fallback: sensor trả JPEG trực tiếp
@@ -578,7 +660,7 @@ static bool capture_jpeg(void) {
             ok = true;
         }
     }
-    uint16_t w = fb->width, h = fb->height;
+
     esp_camera_fb_return(fb);
 
     if (ok && outJpg && outLen > 0 && outLen <= AI_JPEG_BUF_SIZE && jpegSize == 0) {
@@ -591,7 +673,12 @@ static bool capture_jpeg(void) {
     }
 
     if (ok && jpegSize > 0) {
-        Serial.printf("[AI] Đã chụp: %ux%u -> JPEG %u bytes\n", w, h, (unsigned)jpegSize);
+#ifdef CAM_ROTATE_DEGREES
+        Serial.printf("[AI] Đã chụp: %ux%u (Xoay bù %.0f° -> %ux%u) -> JPEG %u bytes\n",
+                      srcW, srcH, (float)CAM_ROTATE_DEGREES, encodeW, encodeH, (unsigned)jpegSize);
+#else
+        Serial.printf("[AI] Đã chụp: %ux%u -> JPEG %u bytes\n", encodeW, encodeH, (unsigned)jpegSize);
+#endif
         return true;
     }
     Serial.println("[AI] Lỗi nén JPEG (fmt2jpg)!");
