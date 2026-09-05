@@ -15,6 +15,7 @@
 #include "ai_pipeline.h"
 #include "secrets.h"
 #include "config_portal.h"
+#include "button.h"
 #include "offline_sounds.h"
 
 // ============================================================
@@ -41,11 +42,11 @@ void auto_volume_task_start(void);
 // FACTORY RESET: hold button 5s on boot
 // ============================================================
 static void check_factory_reset(void) {
-    pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    button_init();                 // debounce phần mềm (nút không có tụ)
     uint32_t t = millis();
     bool held = true;
     while (millis() - t < 5000) {
-        if (digitalRead(BTN_TRIGGER) != LOW) { held = false; break; }
+        if (!button_is_down()) { held = false; break; }
         delay(10);
     }
     if (held) {
@@ -93,7 +94,7 @@ void setup() {
 
     // --- Trigger button (AI / Hủy SOS - Active LOW, Internal Pull-Up) ---
     #ifdef ENABLE_CAMERA_OV2640
-    pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    button_init();
     Serial.println("[INIT] Trigger button ready on GPIO " + String(BTN_TRIGGER));
     #endif
 

@@ -15,7 +15,7 @@
 #define SPK_DMA_BUF_LEN    1024
 
 // Ngưỡng Pre-buffering: đệm siêu nhanh ~80ms là phát ngay ra loa
-#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 8 / 100)
+#define STREAM_PREBUFFER_SAMPLES (TONE_SAMPLE_RATE * 25 / 100)   // 250ms
 
 static int16_t *toneBuf = NULL;
 static volatile bool tonePlaying = false;

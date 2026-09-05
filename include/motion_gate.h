@@ -15,5 +15,7 @@ void    motion_gate_update(float svG, float gyroDegS = 0.0f);
 bool    motion_gate_enabled(void);
 // Reset buffers + state (e.g. on task start).
 void    motion_gate_reset(void);
+// Get current window metrics (stddev & peak-to-peak in g)
+void    motion_gate_get_metrics(float *out_stddev, float *out_p2p);
 
 #endif

@@ -58,7 +58,7 @@ Single environment: `esp32-s3-devkitc-1` (Arduino framework, 16MB Flash QIO, 8MB
 
 ## Motion Gate & An Toàn
 
-- **Motion Gate**: Cảm biến siêu âm chỉ phát tiếng bíp khi người dùng thực sự bước đi ($\text{StdDev} \ge 0.12\text{G}$ và $\text{Peak-to-Peak} \ge 0.25\text{G}$ kéo dài $\ge 600\text{ms}$). Đứng yên hoặc xoay đầu nhìn quanh tại chỗ $\rightarrow$ Kính im lặng $100\%$.
+- **Cảm biến siêu âm (HC-SR04)**: Luôn hoạt động độc lập (không phụ thuộc MPU). Tầm quét mở rộng đến $85\text{cm}$ để báo sớm từ xa với 3 vùng cảnh báo (giữ nguyên tần suất bíp từng cấp độ): Safe ($50-85\text{cm}$, thong thả $550\text{ms}$), Warn ($25-50\text{cm}$, vừa $320\text{ms}$), Danger ($\le 25\text{cm}$, dồn dập $180\text{ms}$). Nếu người dùng đứng lại trước vật cản (khoảng cách chỉ dao động trong phạm vi $\le 5\text{cm}$ quá $1.2\text{s}$), kính sẽ tự động dừng tiếng bíp để tránh phiền tai. Khi người dùng di chuyển lại gần hơn ($\ge 3.5\text{cm}$) hoặc bước vào vùng nguy hiểm hơn, kính sẽ tiếp tục phát chuông cảnh báo ngay lập tức.
 - **Fall Detection**: State machine 3 pha (Free-fall <0.5g → Impact >2.5g → Inactivity 1g for 2s) → Cửa sổ hủy 10s → SOS alarm. Lấy mẫu MPU6050 duy trì ổn định $40\text{Hz}$ (delay 25ms cố định).
 - **Auto Volume**: Đo RMS độ ồn môi trường để tự động chỉnh mức âm lượng loa 1–21.
 

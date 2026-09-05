@@ -6,6 +6,7 @@
 #include "tts_driver.h"
 #include "secrets.h"
 #include "offline_sounds.h"
+#include "button.h"
 #include <ArduinoJson.h>
 
 #ifdef ENABLE_AI_PIPELINE
@@ -275,7 +276,7 @@ static bool base64_encode(const uint8_t *data, size_t length,
 // ============================================================
 static bool rec_mic_install(void) {
     static bool installed = false;
-    if (installed) return true;
+    if (installed) { i2s_start(I2S_MIC_PORT); return true; }
 
     i2s_config_t i2s_cfg = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -471,26 +472,21 @@ static size_t record_until_release(void) {
     unsigned long start = millis();
     bool released = false;
     unsigned long releaseTime = 0;
-    int highStableCount = 0;
 
     while ((millis() - start < AI_AUDIO_MAX_RECORD_MS) &&
            (samples < AI_AUDIO_MAX_SAMPLES)) {
         
-        // Chống nhiễu rung phím tuyệt đối: Chỉ coi là nhả nút khi tín hiệu HIGH duy trì ổn định
-        if (digitalRead(BTN_TRIGGER) == HIGH) {
-            highStableCount++;
-            if (!released && highStableCount >= 3) {
+        // Trạng thái nút đã được lọc nhiễu sẵn bởi module button (20ms).
+        // Cộng thêm 250ms xác nhận để tay run / tiếp điểm hở chớp nhoáng
+        // không làm cắt ngang câu nói.
+        if (!button_is_down()) {
+            if (!released) {
                 released = true;
                 releaseTime = millis();
             }
+            if (millis() - releaseTime >= BTN_RELEASE_CONFIRM_MS) break;
         } else {
-            // Người dùng vẫn đang đè nút -> Reset ngay trạng thái nhả nút!
-            highStableCount = 0;
             released = false;
-        }
-
-        if (released && (millis() - releaseTime >= 250)) {
-            break;
         }
 
         size_t bytes_read = 0;
@@ -549,6 +545,8 @@ static size_t record_until_release(void) {
             recordBuf[samples++] = 0;
         }
     }
+    i2s_stop(I2S_MIC_PORT);
+    i2s_zero_dma_buffer(I2S_MIC_PORT);
     return samples;
 }
 
@@ -715,120 +713,111 @@ static bool isFollowUpSession = false;
 // Bấm đúp 2 lần giữ -> Tiếng "Tít-Tít"   -> Nối tiếp hội thoại (Soi lại ảnh cũ)
 // ============================================================
 static void ai_audio_task(void *pv) {
-    pinMode(BTN_TRIGGER, INPUT_PULLUP);
+    button_init();
     alloc_buffers(); // Cấp phát PSRAM ngay khi khởi động để lần bấm đầu tiên luôn sẵn sàng 100%!
-    int lastBtn = HIGH;
-    uint32_t debounceMs = 0;
-    uint32_t lastBtnReleaseMs = 0;
+    button_clear_events();
+
     while (true) {
-        int btn = digitalRead(BTN_TRIGGER);
-        uint32_t now = millis();
-        if (btn == LOW && lastBtn == HIGH && (now - debounceMs) > 50) {
-            debounceMs = now;
-            #ifdef ENABLE_MPU6050_FALL_DETECTION
-            if (fall_alarm_busy()) {
-                fall_alarm_dismiss();
-                lastBtn = btn;
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
+        // ---- Chờ 1 sự kiện nhấn ĐÃ LỌC NHIỄU ----
+        if (!button_take_press_event()) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        #ifdef ENABLE_MPU6050_FALL_DETECTION
+        if (fall_alarm_busy()) {
+            fall_alarm_dismiss();
+            button_wait_release(3000);
+            button_clear_events();
+            continue;
+        }
+        if (fall_alarm_was_cancelled_recently()) {
+            button_wait_release(3000);
+            button_clear_events();
+            continue;
+        }
+        #endif
+
+        // ---- Bấm trong lúc đang chạy -> HỦY ----
+        if (pipelineBusy) {
+            tone_driver_waiting_music_set(false);
+            tts_driver_stop();
+            tone_driver_stream_set_active(false);
+            pipelineBusy = false;
+            dataReady = false;
+            button_wait_release(5000);
+            button_clear_events();
+            continue;
+        }
+
+        if (!alloc_buffers()) { button_clear_events(); continue; }
+
+        // ------------------------------------------------------------
+        // Phân loại thao tác. button_is_down() không bao giờ nháy do
+        // nhiễu -> vòng while dưới đây không còn bị thoát sớm nữa.
+        // ------------------------------------------------------------
+        uint32_t pressStart = millis();
+        bool isHold = false;
+        while (button_is_down()) {
+            if (millis() - pressStart >= BTN_HOLD_MS) { isHold = true; break; }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        if (isHold) {
+            // 1. BẤM GIỮ ĐƠN (HOLD TO TALK) -> HỎI CÂU HỎI MỚI (CHỦ ĐỀ MỚI)
+            isFollowUpSession = false;
+            clear_session_memory();
+            Serial.printf("[%6.2fs][BTN] >>> BẤM GIỮ ĐƠN: HỎI CÂU HỎI MỚI <<< \n", millis() / 1000.0f);
+            tone_driver_play_quick_beep(); // 🎵 Tiếng "Tít" đơn
+            recordSamples = record_until_release();
+        } else {
+            // Nhấp nhả nhanh -> đợi xem có cú nhấn thứ 2 không (Double-Click)
+            uint32_t waitSecond = millis();
+            bool hasSecondPress = false;
+            while (millis() - waitSecond < BTN_DOUBLE_CLICK_MS) {
+                if (button_take_press_event()) { hasSecondPress = true; break; }
+                vTaskDelay(pdMS_TO_TICKS(5));
             }
-            if (fall_alarm_was_cancelled_recently()) {
-                lastBtn = btn;
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
-            }
-            #endif
-            if (!pipelineBusy) {
-                // Khử rung dội phím ban đầu
-                vTaskDelay(pdMS_TO_TICKS(15));
-                if (digitalRead(BTN_TRIGGER) != LOW) {
-                    lastBtn = HIGH;
-                    continue;
-                }
 
-                if (!alloc_buffers()) continue;
-
-                uint32_t pressStart = millis();
-                bool isHold = false;
-                
-                // Đợi tối đa 250ms xem người dùng đè giữ hay nhấp nhả
-                while (digitalRead(BTN_TRIGGER) == LOW) {
-                    if (millis() - pressStart >= 250) {
-                        isHold = true;
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                }
-
-                if (isHold) {
-                    // 1. BẤM GIỮ ĐƠN (HOLD TO TALK) -> HỎI CÂU HỎI MỚI (CHỦ ĐỀ MỚI)
-                    isFollowUpSession = false;
-                    clear_session_memory();
-                    Serial.printf("[%6.2fs][BTN] >>> BẤM GIỮ ĐƠN: HỎI CÂU HỎI MỚI <<< \n", millis() / 1000.0f);
-                    tone_driver_play_quick_beep(); // 🎵 Tiếng "Tít" đơn
-                    recordSamples = record_until_release();
-                } else {
-                    // Người dùng vừa nhấp nhả nhanh (< 250ms)
-                    // Đợi tối đa 300ms xem có cái nhấn thứ 2 không (Double-Click)
-                    uint32_t waitSecond = millis();
-                    bool hasSecondPress = false;
-                    while (millis() - waitSecond < 300) {
-                        if (digitalRead(BTN_TRIGGER) == LOW) {
-                            vTaskDelay(pdMS_TO_TICKS(15)); // Chống rung phím lần 2
-                            if (digitalRead(BTN_TRIGGER) == LOW) {
-                                hasSecondPress = true;
-                                break;
-                            }
-                        }
-                        vTaskDelay(pdMS_TO_TICKS(5));
-                    }
-
-                    if (hasSecondPress) {
-                        // 2. BẤM ĐÚP (DOUBLE-CLICK) -> NỐI TIẾP HỘI THOẠI CŨ (GIỮ NGUYÊN TRÍ NHỚ)
-                        isFollowUpSession = true;
-                        Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI (GIỮ TRÍ NHỚ) <<< \n", millis() / 1000.0f);
-                        tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
-                        recordSamples = record_until_release();
-                    } else {
-                        // 3. NHẤP NHANH 1 CÁI (SINGLE CLICK) -> CHỤP ẢNH MÔ TẢ NGAY (KHÔNG GHI ÂM)
-                        isFollowUpSession = false;
-                        clear_session_memory();
-                        Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH 1 CÁI: CHỤP ẢNH MÔ TẢ NGAY <<< \n", millis() / 1000.0f);
-                        tone_driver_play_quick_beep();
-                        recordSamples = 0;
-                    }
-                }
-
-                // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
-                setCpuFrequencyMhz(240);
-
-                tts_driver_stop();
-
-                pipelineBusy = true;
-                dataReady = false;
-                jpegSize = 0;
-
-                // Chụp ảnh ngay lập tức
-                if (!capture_jpeg()) {
-                    pipelineBusy = false;
-                    continue;
-                }
-
-                dataReady = true;
-                // Bật nhạc chờ Elevator Music từ PSRAM (Zero-CPU) trong lúc gửi và chờ AI xử lý
-                tone_driver_waiting_music_set(true);
-                Serial.printf("[%6.2fs][AI] Đã chụp ảnh (%zu bytes) + %zu samples audio -> Gửi lên Gemini [%s]...\n",
-                              millis() / 1000.0f, jpegSize, recordSamples, isFollowUpSession ? "Nối tiếp" : "Mới");
+            if (hasSecondPress) {
+                // 2. BẤM ĐÚP (DOUBLE-CLICK) -> NỐI TIẾP HỘI THOẠI CŨ (GIỮ NGUYÊN TRÍ NHỚ)
+                isFollowUpSession = true;
+                Serial.printf("[%6.2fs][BTN] >>> BẤM ĐÚP (DOUBLE-CLICK): NỐI TIẾP HỘI THOẠI (GIỮ TRÍ NHỚ) <<< \n", millis() / 1000.0f);
+                tone_driver_play_double_beep(); // 🎵 Tiếng "Tít-Tít" đôi
+                recordSamples = record_until_release();
             } else {
-                // Bấm trong lúc đang chạy -> hủy
-                tone_driver_waiting_music_set(false);
-                tts_driver_stop();
-                tone_driver_stream_set_active(false);
-                pipelineBusy = false; dataReady = false;
+                // 3. NHẤP NHANH 1 CÁI (SINGLE CLICK) -> CHỤP ẢNH MÔ TẢ NGAY (KHÔNG GHI ÂM)
+                isFollowUpSession = false;
+                clear_session_memory();
+                Serial.printf("[%6.2fs][BTN] >>> NHẤP NHANH 1 CÁI: CHỤP ẢNH MÔ TẢ NGAY <<< \n", millis() / 1000.0f);
+                tone_driver_play_quick_beep();
+                recordSamples = 0;
             }
         }
-        lastBtn = btn;
-        vTaskDelay(pdMS_TO_TICKS(20));
+
+        // Nhiễu lúc NHẢ nút không được tính là lần bấm mới
+        button_clear_events();
+
+        // Tăng tốc CPU lên 240MHz để xử lý ảnh, nén JPEG và AI siêu tốc
+        setCpuFrequencyMhz(240);
+
+        tts_driver_stop();
+
+        pipelineBusy = true;
+        dataReady = false;
+        jpegSize = 0;
+
+        // Chụp ảnh ngay lập tức
+        if (!capture_jpeg()) {
+            pipelineBusy = false;
+            continue;
+        }
+
+        dataReady = true;
+        // Bật nhạc chờ Elevator Music từ PSRAM (Zero-CPU) trong lúc gửi và chờ AI xử lý
+        tone_driver_waiting_music_set(true);
+        Serial.printf("[%6.2fs][AI] Đã chụp ảnh (%zu bytes) + %zu samples audio -> Gửi lên Gemini [%s]...\n",
+                      millis() / 1000.0f, jpegSize, recordSamples, isFollowUpSession ? "Nối tiếp" : "Mới");
     }
 }
 

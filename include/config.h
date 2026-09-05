@@ -126,6 +126,12 @@
 // ============================================================
 #define BTN_TRIGGER       14
 
+// --- Nút KHÔNG có tụ debounce phần cứng -> lọc nhiễu bằng phần mềm ---
+// (xem include/button.h - lấy mẫu 2ms, xác nhận 20ms)
+#define BTN_HOLD_MS            300   // Đè >= 300ms  = BẤM GIỮ (hold-to-talk)
+#define BTN_DOUBLE_CLICK_MS    350   // Cửa sổ chờ cú nhấn thứ 2
+#define BTN_RELEASE_CONFIRM_MS 250   // Nhả ổn định 250ms mới dừng ghi âm
+
 // ============================================================
 // ULTRASONIC HC-SR04 - Hộp Phải, hướng chính diện
 // CẢNH BÁO: KHÔNG dùng GPIO8/9 — trùng CAM_Y4/CAM_Y3 (bus DVP
@@ -158,15 +164,15 @@
 
 // ============================================================
 // ULTRASONIC HC-SR04 - Beep Thresholds (cm)
-// 4 zones: DANGER (<=18cm) | WARN (18-32cm) | SAFE (32-45cm) | NONE (>45cm, silent)
-// Giới hạn trong 45cm để chỉ báo vật cản gần thiết thực, không báo xa
+// 4 zones: DANGER (<=25cm) | WARN (25-50cm) | SAFE (50-85cm) | NONE (>85cm, silent)
+// Mở rộng tầm xa 85cm và tăng độ nhạy báo sớm, giữ nguyên tần suất báo từng cấp độ
 // ============================================================
-#define ZONE_DANGER          18   // D <= 18cm: FAST beep (rất gần)
-#define ZONE_WARN            32   // 18-32cm: MED beep (gần)
-#define ZONE_SAFE            45   // 32-45cm: SLOW beep (chú ý)
-#define ZONE_HYSTERESIS      2    // Hysteresis chống chập chờn ranh giới
+#define ZONE_DANGER          25   // D <= 25cm: FAST beep (chuông dồn dập 180ms - rất gần)
+#define ZONE_WARN            50   // 25-50cm: MED beep (chuông vừa 320ms - cự ly trung bình)
+#define ZONE_SAFE            85   // 50-85cm: SLOW beep (chuông thong thả 550ms - báo sớm từ xa)
+#define ZONE_HYSTERESIS      3    // Hysteresis chống chập chờn ranh giới (3cm)
 
-// Beep intervals (ms) - khoảng thời gian giữa các hồi chuông
+// Beep intervals (ms) - khoảng thời gian giữa các hồi chuông (giữ nguyên tần suất)
 #define INTERVAL_FAST        180   // DANGER zone (chuông dồn dập 180ms)
 #define INTERVAL_MED         320   // WARN zone (chuông vừa 320ms)
 #define INTERVAL_SLOW        550   // SAFE zone (chuông thong thả 550ms)
@@ -182,6 +188,11 @@
 #define US_TIMEOUT_US        15000 // Echo timeout ~2.5m (bỏ qua phản xạ xa)
 #define US_SPEED_CM_US       0.0343f // Sound speed cm/us
 
+// Ultrasonic Stationary Suppression (Tự động tắt tiếng khi đứng yên trước vật cản)
+#define US_STATIONARY_DELTA_CM    5.0f   // Ngưỡng đứng yên: khoảng cách chỉ thay đổi trong tầm <= 5cm
+#define US_STATIONARY_MUTE_MS     1200   // Đứng yên sau 1.2s -> Tạm ngắt tiếng bíp
+#define US_APPROACH_DELTA_CM      3.5f   // Di chuyển lại gần hơn >= 3.5cm -> Tiếp tục cảnh báo ngay
+
 // Debug
 #define US_DEBUG             1    // 1=on, 0=off (enable for debugging)
 #define US_DEBUG_INTERVAL    2000
@@ -192,10 +203,11 @@
 // Detect by stddev of SV over a sliding window (500ms @ 20ms).
 // Hysteresis timers prevent gate flicker.
 // ============================================================
-#define MOTION_WINDOW_SAMPLES  30   // 30 samples x 20ms = 600ms window
-#define MOTION_STDDEV_G       0.12  // Motion stddev threshold (g)
-#define MOTION_ON_MS          600   // Enable gate after 600ms of sustained walking footsteps
-#define MOTION_OFF_MS         800   // Disable gate after 800ms of sustained stillness
+#define MOTION_WINDOW_SAMPLES  20   // 20 samples x ~25ms = 500ms window (nhạy và phản hồi nhanh)
+#define MOTION_STDDEV_G       0.055 // Motion stddev threshold (g) - tăng độ nhạy nhận diện bước chân
+#define MOTION_P2P_G          0.12  // Motion peak-to-peak threshold (g) - biên độ dao động khi bước đi
+#define MOTION_ON_MS          180   // Enable gate nhanh sau ~180ms phát hiện bước chân
+#define MOTION_OFF_MS         1200  // Giữ gate bật trong 1.2s nghỉ giữa các bước chân (tránh ngắt quãng)
 
 // ============================================================
 // FALL DETECTION THRESHOLDS (3-Phase Algorithm)
