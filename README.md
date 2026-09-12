@@ -20,14 +20,28 @@ Aegis Sight là thiết bị đeo hỗ trợ người khiếm thị xây dựng 
   - **Bấm Giữ ($\ge 250\text{ms}$)**: Hỏi câu hỏi mới (Tiếng "Tít" đơn, reset ngữ cảnh).
   - **Bấm Đúp (Nhấp 1 cái $\rightarrow$ Bấm giữ cái thứ 2)**: Nối tiếp hội thoại cũ (Tiếng "Tít-Tít" đôi, soi lại ảnh cũ và nhớ câu trả lời trước).
   - **Nhấp Nhanh 1 Cái (<250ms)**: Chụp ảnh mô tả nhanh quang cảnh/chữ viết phía trước (không cần nói).
+
+https://github.com/user-attachments/assets/9ad10305-b671-4515-bde3-f32feec600b8
+
+<p align="center"><sub><em>Demo feature: Cử chỉ nút bấm & phản hồi AI đa tầng (🔊 Bật âm thanh để nghe phản hồi loa)</em></sub></p>
+
 - **🚶 Motion Gate (Cảm Biến Siêu Âm Thông Minh)**:
   - Cảm biến khoảng cách HC-SR04 **chỉ phát tiếng bíp khi người dùng thực sự bước đi** (nhận diện xung lực gót chân đập xuống đất: $\text{StdDev} \ge 0.12\text{G}$ và $\text{P2P} \ge 0.25\text{G}$).
   - Đứng yên, ngồi yên hoặc **xoay đầu nhìn quanh tại chỗ $\rightarrow$ Mute $100\%$**, trả lại không gian yên tĩnh.
+
+https://github.com/user-attachments/assets/c8f814bc-7011-4c58-a6e2-c438269c0b52
+
+<p align="center"><sub><em>Demo feature: Motion Gate cảm biến siêu âm (🔊 Bật âm thanh để nghe tiếng bíp cảnh báo vật cản)</em></sub></p>
+
 - **🚨 Phát Hiện Té Ngã (Fall Detection 3 Pha)**:
   - MPU6050 nhận diện: Rơi tự do ($<0.5\text{g}$) $\rightarrow$ Va đập ($>2.5\text{g}$) $\rightarrow$ Bất động ($\approx 1\text{g}$).
   - Cửa sổ hủy 10s (bấm nút để hủy) $\rightarrow$ Phát còi báo động SOS cứu hộ ra loa.
-- **🔊 Tự Động Điều Chỉnh Âm Lượng (Auto-Volume)**:
-  - Micro đo độ ồn môi trường và tự động map mức âm lượng loa từ 1–21.
+
+https://github.com/user-attachments/assets/5a917cbf-5cbe-458b-b86c-3e41018f8a89
+
+<p align="center"><sub><em>Demo feature: Thuật toán phát hiện té ngã 3 pha & còi SOS (🔊 Bật âm thanh để nghe còi cứu hộ)</em></sub></p>
+
+
 - **⚙️ Config Portal (Cấu Hình Lần Đầu)**:
   - Tự phát Wi-Fi AP `AegisSight-Setup` $\rightarrow$ Mở Captive Portal nhập SSID/Pass + API Key lưu NVS.
 
