@@ -44,6 +44,7 @@ https://github.com/user-attachments/assets/5a917cbf-5cbe-458b-b86c-3e41018f8a89
 
 - **⚙️ Config Portal (Cấu Hình Lần Đầu)**:
   - Tự phát Wi-Fi AP `AegisSight-Setup` $\rightarrow$ Mở Captive Portal nhập SSID/Pass + API Key lưu NVS.
+  - Sau này muốn setup lại có thể bấm 5 lần vào nút nguồn (GPIO 14) hoặc reset dữ liệu PSRAM
 
 ---
 
