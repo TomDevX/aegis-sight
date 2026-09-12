@@ -4,6 +4,8 @@
 
 Aegis Sight là thiết bị đeo hỗ trợ người khiếm thị xây dựng trên nền tảng vi điều khiển **ESP32-S3 (16MB Flash, 8MB PSRAM)** tích hợp Camera, Micro I2S, Loa Khuếch đại MAX98357A, Cảm biến Siêu âm HC-SR04 và IMU MPU6050 — tương tác giọng nói thời gian thực với độ trễ cực thấp (<1.5s) thông qua kiến trúc **Đa Tầng AI Hoán Đổi Thông Minh (Google Gemini + Groq LPU)**.
 
+![Aegis Sight real life prototype](./prototype.jpg)
+
 ---
 
 ## 🌟 Tính Năng Nổi Bật
@@ -41,6 +43,9 @@ Aegis Sight là thiết bị đeo hỗ trợ người khiếm thị xây dựng 
 | **Siêu Âm HC-SR04** | Trig / Echo | `Trig=46, Echo=3` | Nguồn 5V từ Buck, chân tự do an toàn |
 | **MPU6050 (I2C)** | SDA / SCL | `SDA=47, SCL=39` | Bus I2C phần cứng |
 | **Nút Nhấn Trigger** | Data / GND | `GPIO14 (INPUT_PULLUP)` | Active LOW |
+
+![Sơ đồ khối](diagrams/so-do-khoi.jpg)
+![Sơ đồ tổng quát](diagrams/so-do-tong-quat.jpg)
 
 ---
 
