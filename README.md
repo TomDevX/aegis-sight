@@ -26,16 +26,17 @@ https://github.com/user-attachments/assets/9ad10305-b671-4515-bde3-f32feec600b8
 <p align="center"><sub><em>Demo feature: Cử chỉ nút bấm & phản hồi AI đa tầng (🔊 Bật âm thanh để nghe phản hồi loa)</em></sub></p>
 
 - **🚶 Motion Gate (Cảm Biến Siêu Âm Thông Minh)**:
-  - Cảm biến khoảng cách HC-SR04 **chỉ phát tiếng bíp khi người dùng thực sự bước đi** (nhận diện xung lực gót chân đập xuống đất: $\text{StdDev} \ge 0.12\text{G}$ và $\text{P2P} \ge 0.25\text{G}$).
-  - Đứng yên, ngồi yên hoặc **xoay đầu nhìn quanh tại chỗ $\rightarrow$ Mute $100\%$**, trả lại không gian yên tĩnh.
+  - Cảm biến khoảng cách HC-SR04 **chỉ phát tiếng bíp khi người dùng thực sự đang bước gần tới nguy hiểm**
+  - Khi đứng yên không chuyển động thì máy không cảnh báo nữa
 
 https://github.com/user-attachments/assets/c8f814bc-7011-4c58-a6e2-c438269c0b52
 
 <p align="center"><sub><em>Demo feature: Motion Gate cảm biến siêu âm (🔊 Bật âm thanh để nghe tiếng bíp cảnh báo vật cản)</em></sub></p>
 
 - **🚨 Phát Hiện Té Ngã (Fall Detection 3 Pha)**:
-  - MPU6050 nhận diện: Rơi tự do ($<0.5\text{g}$) $\rightarrow$ Va đập ($>2.5\text{g}$) $\rightarrow$ Bất động ($\approx 1\text{g}$).
-  - Cửa sổ hủy 10s (bấm nút để hủy) $\rightarrow$ Phát còi báo động SOS cứu hộ ra loa.
+  - MPU6050 nhận diện: Rơi tự do ($<0.5\text{g}$) $\rightarrow$ Va đập ($>2.5\text{g}$) $\rightarrow$ Bất động 3s ($\approx 1\text{g}$).
+  - Phát còi báo động SOS cứu hộ ra loa.
+  - Có thể hủy cảnh báo giả bằng nút nguồn (GPIO 14)
 
 https://github.com/user-attachments/assets/5a917cbf-5cbe-458b-b86c-3e41018f8a89
 
