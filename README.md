@@ -153,3 +153,24 @@ src/
 ├── secrets.cpp           NVS Preferences lưu trữ credentials
 └── config_portal.cpp     Web captive portal cấu hình Wi-Fi lần đầu
 ```
+
+---
+
+## 🏆️ Honors and Recognition
+
+* **PIFKID IoT (HCMUT x Intel)** - *Champion (1st prize)* (2026)
+* Detail: Được chấm điểm và đánh giá bởi các giảng viên HCMUT và hội đồng từ Intel
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/d9c7dbca-b27f-4bd9-a553-7051017b1eb2" alt="Award Ceremony" width="60%" />
+  <br />
+  <em>Thuyết minh dự án và nhận giải tại báo cáo cuối khóa PIFKID</em>
+</p>
+
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/22b6eab5-4ef5-48df-a098-739e19b59aea" alt="Award with Prototype" width="60%" />
+  <br />
+  <em>Giải champion cùng sản phẩm</em>
+</p>
+
