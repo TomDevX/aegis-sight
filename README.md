@@ -1,4 +1,4 @@
-# Aegis Sight
+# Aegis Sight ([English version](./README_en.md))
 
 **Kính Thông Minh Trợ Thị Tích Hợp Đa Trí Tuệ Nhân Tạo Dành Cho Người Khiếm Thị**
 
